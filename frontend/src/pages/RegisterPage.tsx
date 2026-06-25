@@ -1,7 +1,7 @@
 import { useState, useEffect, type FormEvent } from 'react'
 import { useParams } from 'react-router-dom'
 import api from '@/lib/api'
-import { BarChart3, CheckCircle, Loader2 } from 'lucide-react'
+import { CheckCircle, Loader2 } from 'lucide-react'
 
 interface TokenInfo {
   email: string
@@ -11,8 +11,10 @@ interface TokenInfo {
 function Brand() {
   return (
     <div className="mb-8 text-center">
-      <div className="inline-flex items-center justify-center h-12 w-12 rounded-xl bg-sapphire mb-4">
-        <BarChart3 className="h-6 w-6 text-white" />
+      <div className="mb-4 flex items-center justify-center gap-4">
+        <img src="/utm-logo.png" alt="Universiti Teknologi Malaysia" className="h-14 w-auto object-contain" />
+        <span className="h-12 w-px bg-line" aria-hidden="true" />
+        <img src="/ascend-2030.png" alt="ASCEND 2030" className="h-14 w-auto object-contain" />
       </div>
       <h1 className="font-display text-2xl font-semibold text-text">AlumIndex</h1>
       <p className="mt-1 text-sm text-muted">Alumni intelligence platform</p>
