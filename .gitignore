@@ -2,6 +2,9 @@
 .env
 .env.local
 .env.*.local
+# Spring local profile holds plaintext credentials for local dev
+application-local.yml
+**/application-local.yml
 
 # Build output
 backend/target/

@@ -36,10 +36,11 @@ jobs:
         run: npm ci
 
       - name: Build
-        # Set the repo *variable* VITE_API_BASE_URL to your deployed backend URL
-        # (bare URL, no /api, no trailing slash). Unset = falls back to localhost.
+        # Backend URL baked into the frontend bundle at build time.
+        # Hardcoded here (instead of a repo variable) so the deploy can't break
+        # if the variable is unset/wrong. Change this if the backend host changes.
         env:
-          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+          VITE_API_BASE_URL: https://alumindex-backend.onrender.com
         run: npm run build
 
       - name: SPA fallback for client-side routes
