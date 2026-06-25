@@ -1,0 +1,70 @@
+spring:
+  application:
+    name: alumindex-backend
+
+  datasource:
+    url: ${DB_URL:jdbc:postgresql://localhost:5432/alumindex}
+    username: ${DB_USERNAME:postgres}
+    password: ${DB_PASSWORD:postgres}
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      ddl-auto: validate
+    properties:
+      hibernate:
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+        format_sql: false
+    show-sql: false
+    open-in-view: false
+
+  flyway:
+    enabled: true
+    locations: classpath:db/migration
+    baseline-on-migrate: true
+
+  mail:
+    host: ${MAIL_HOST:smtp.gmail.com}
+    port: ${MAIL_PORT:587}
+    username: ${MAIL_USERNAME:}
+    password: ${MAIL_PASSWORD:}
+    properties:
+      mail.smtp.auth: true
+      mail.smtp.starttls.enable: true
+
+  servlet:
+    multipart:
+      max-file-size: 51MB   # allow up to 50 MB + header overhead; enforced precisely in service
+      max-request-size: 52MB
+
+alumindex:
+  jwt:
+    secret: ${JWT_SECRET:dev-secret-change-in-production-must-be-32-chars}
+    expiration-ms: 86400000  # 24 hours
+  openai:
+    api-key: ${OPENAI_API_KEY:}
+    model: gpt-4o-mini
+    temperature: 0
+  frontend:
+    origin: ${FRONTEND_ORIGIN:http://localhost:5173}
+
+server:
+  port: 8080
+  error:
+    include-message: never
+    include-stacktrace: never
+    include-exception: false
+
+management:
+  endpoints:
+    web:
+      exposure:
+        include: health
+  endpoint:
+    health:
+      show-details: never
+  health:
+    mail:
+      # mail is optional (MailService skips when unconfigured); the SMTP probe
+      # adds ~10s per health call and marks the app DOWN when creds are blank
+      enabled: false

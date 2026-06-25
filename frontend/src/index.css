@@ -1,0 +1,50 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    --radius: 0.5rem;
+
+    /* shadcn/ui semantic tokens — bone (light) shell */
+    --background: 40 20% 96%;       /* bone #F5F4EF */
+    --foreground: 215 35% 12%;      /* text #172230 */
+    --card: 0 0% 100%;
+    --card-foreground: 215 35% 12%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 215 35% 12%;
+    --primary: 340 65% 33%;         /* UTM maroon #8C1D40 */
+    --primary-foreground: 0 0% 100%;
+    --secondary: 40 14% 91%;
+    --secondary-foreground: 215 35% 12%;
+    --muted: 40 14% 91%;
+    --muted-foreground: 213 11% 44%; /* muted #657182 */
+    --accent: 40 14% 91%;
+    --accent-foreground: 215 35% 12%;
+    --destructive: 5 60% 47%;       /* red #BB3B2E */
+    --destructive-foreground: 0 0% 100%;
+    --border: 39 13% 87%;           /* line #E5E2D9 */
+    --input: 39 13% 87%;
+    --ring: 340 65% 33%;
+  }
+}
+
+@layer base {
+  * {
+    border-color: hsl(var(--border));
+  }
+  body {
+    background-color: hsl(var(--background));
+    color: hsl(var(--foreground));
+    font-family: Inter, system-ui, sans-serif;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+  }
+  /* Reduced motion */
+  @media (prefers-reduced-motion: reduce) {
+    * {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
