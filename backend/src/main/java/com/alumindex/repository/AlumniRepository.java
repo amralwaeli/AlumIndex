@@ -33,7 +33,8 @@ public interface AlumniRepository extends JpaRepository<Alumni, UUID> {
         LEFT JOIN FETCH a.profile p
         WHERE a.tenant.id = :tenantId
           AND (:pattern IS NULL OR LOWER(a.fullName) LIKE :pattern
-               OR LOWER(p.employer) LIKE :pattern)
+               OR LOWER(p.employer) LIKE :pattern
+               OR LOWER(p.jobTitle) LIKE :pattern)
           AND (:industry IS NULL OR p.industry = :industry)
           AND (:seniority IS NULL OR p.seniority = :seniority)
         """,
@@ -42,7 +43,8 @@ public interface AlumniRepository extends JpaRepository<Alumni, UUID> {
         LEFT JOIN a.profile p
         WHERE a.tenant.id = :tenantId
           AND (:pattern IS NULL OR LOWER(a.fullName) LIKE :pattern
-               OR LOWER(p.employer) LIKE :pattern)
+               OR LOWER(p.employer) LIKE :pattern
+               OR LOWER(p.jobTitle) LIKE :pattern)
           AND (:industry IS NULL OR p.industry = :industry)
           AND (:seniority IS NULL OR p.seniority = :seniority)
         """)
