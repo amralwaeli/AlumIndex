@@ -1,0 +1,62 @@
+name: Deploy frontend to GitHub Pages
+
+# Builds the Vite frontend and publishes it to GitHub Pages on every push to main.
+# Served at the custom apex domain https://alumindex.org (CNAME lives in
+# frontend/public/CNAME, so it is copied into the build output automatically).
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        # Set the repo *variable* VITE_API_BASE_URL to your deployed backend URL
+        # (bare URL, no /api, no trailing slash). Unset = falls back to localhost.
+        env:
+          VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL }}
+        run: npm run build
+
+      - name: SPA fallback for client-side routes
+        # GitHub Pages has no SPA rewrite; serve index.html for unknown paths so
+        # refresh/deep-links (e.g. /login) don't 404.
+        run: cp dist/index.html dist/404.html
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: frontend/dist
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v4
