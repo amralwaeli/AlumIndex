@@ -1,8 +1,0 @@
-com\alumindex\AlumIndexApplicationTests.class
-com\alumindex\security\JwtServiceTest.class
-com\alumindex\pipeline\LlmNormalisationServiceTest.class
-com\alumindex\pipeline\CsvXlsxParserTest.class
-com\alumindex\service\TenantServiceTest.class
-com\alumindex\pipeline\MatchingServiceTest.class
-com\alumindex\service\AlumniServiceCrossTenantTest.class
-com\alumindex\service\AuthServiceTest.class

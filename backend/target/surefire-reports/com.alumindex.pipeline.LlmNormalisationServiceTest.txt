@@ -1,4 +1,0 @@
--------------------------------------------------------------------------------
-Test set: com.alumindex.pipeline.LlmNormalisationServiceTest
--------------------------------------------------------------------------------
-Tests run: 4, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 4.209 s -- in com.alumindex.pipeline.LlmNormalisationServiceTest

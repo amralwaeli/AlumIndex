@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+.env.local
+.env.*.local
+
+# Build output
+backend/target/
+frontend/dist/
+frontend/node_modules/
+node_modules/
+
+# Logs
+*.log
+backend-debug-err.log
+hs_err_pid*.log
+
+# IDE / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+Thumbs.db

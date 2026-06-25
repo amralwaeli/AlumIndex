@@ -1,4 +1,0 @@
--------------------------------------------------------------------------------
-Test set: com.alumindex.AlumIndexApplicationTests
--------------------------------------------------------------------------------
-Tests run: 1, Failures: 0, Errors: 0, Skipped: 0, Time elapsed: 8.364 s -- in com.alumindex.AlumIndexApplicationTests
