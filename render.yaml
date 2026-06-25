@@ -1,0 +1,28 @@
+# Render Blueprint — deploys the AlumIndex Spring Boot backend as a Docker web service.
+# Connect this repo on render.com (New → Blueprint) and Render reads this file.
+# Docs: https://render.com/docs/blueprint-spec
+services:
+  - type: web
+    name: alumindex-backend
+    runtime: docker
+    plan: free
+    region: singapore                       # closest Render region to Malaysia
+    dockerfilePath: ./backend/Dockerfile
+    dockerContext: ./backend                # Dockerfile COPYs pom.xml/src relative to backend/
+    healthCheckPath: /actuator/health
+    autoDeploy: true                        # redeploy on every push to the connected branch
+    envVars:
+      # Non-secret config — safe to keep in the repo
+      - key: FRONTEND_ORIGIN
+        value: https://alumindex.org
+      - key: DB_URL
+        value: jdbc:postgresql://aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres?prepareThreshold=0
+      - key: DB_USERNAME
+        value: postgres.zdhjxnztwsfkgagavxcc
+      # Secrets — Render prompts for these at deploy time (never stored in git)
+      - key: DB_PASSWORD
+        sync: false
+      - key: JWT_SECRET
+        sync: false
+      - key: OPENAI_API_KEY
+        sync: false
