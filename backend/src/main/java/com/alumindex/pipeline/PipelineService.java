@@ -7,12 +7,18 @@ import com.alumindex.pipeline.MatchingService.*;
 import com.alumindex.repository.*;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
 import java.math.BigDecimal;
 import java.util.*;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.Executors;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicBoolean;
+import java.util.concurrent.atomic.AtomicInteger;
 
 /**
  * Orchestrates the 5-step import pipeline asynchronously.
@@ -32,52 +38,87 @@ public class PipelineService {
     private final CareerEventRepository eventRepo;
     private final ImportBatchRepository batchRepo;
 
+    /** Concurrent normalisation workers. Keep ≤ DB pool size and within your OpenAI rate tier. */
+    @Value("${alumindex.import.concurrency:8}")
+    private int concurrency;
+
     @Async
     public void runAsync(UUID tenantId, UUID batchId,
                          List<Map<String, String>> rows, Tenant tenant) {
         var batch = batchRepo.findById(batchId).orElseThrow();
-        var errorLog = new ArrayList<Object>();
+        // worker threads don't inherit this thread's ThreadLocal — capture the
+        // tenant context now so each worker resolves RLS exactly as we do here.
+        final UUID ctxTenant = com.alumindex.common.TenantContext.get();
+
+        var errorLog  = Collections.synchronizedList(new ArrayList<Object>());
         // circuit breaker: once OpenAI proves unavailable, remaining rows go
-        // straight to the deterministic fallback instead of retrying for 7s each
-        var llmDown = new java.util.concurrent.atomic.AtomicBoolean(false);
-        int inserted = 0, updated = 0, unchanged = 0, failed = 0;
+        // straight to the deterministic fallback instead of retrying every row.
+        var llmDown   = new AtomicBoolean(false);
+        var inserted  = new AtomicInteger();
+        var updated   = new AtomicInteger();
+        var unchanged = new AtomicInteger();
+        var failed    = new AtomicInteger();
+        var processed = new AtomicInteger();
 
-        int processed = 0;
-        for (Map<String, String> raw : rows) {
-            try {
-                var result = processRow(tenantId, raw, tenant, llmDown);
-                switch (result) {
-                    case "inserted"  -> inserted++;
-                    case "updated"   -> updated++;
-                    case "unchanged" -> unchanged++;
-                    default          -> failed++;
-                }
-            } catch (LlmUnavailableException e) {
-                failed++;
-                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
-                        "error", "OpenAI API unavailable"));
-                log.warn("LLM unavailable for row {}: {}", raw.get("full_name"), e.getMessage());
-            } catch (AmbiguousMatchException e) {
-                failed++;
-                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
-                        "error", "AMBIGUOUS_NAME"));
-            } catch (Exception e) {
-                failed++;
-                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
-                        "error", e.getMessage()));
-                log.warn("Row processing error: {}", e.getMessage());
+        int total   = rows.size();
+        int workers = Math.max(1, Math.min(concurrency, total));
+
+        // Partition rows by identity so every row referring to the same person
+        // lands in one bucket and is processed in order. This keeps the original
+        // insert-then-update semantics and prevents two threads from inserting
+        // the same person twice (the duplicate race).
+        List<List<Map<String, String>>> buckets = partitionByIdentity(rows, workers);
+
+        var pool  = Executors.newFixedThreadPool(workers);
+        var latch = new CountDownLatch(buckets.size());
+        try {
+            for (var bucket : buckets) {
+                pool.submit(() -> {
+                    if (ctxTenant != null) com.alumindex.common.TenantContext.set(ctxTenant);
+                    try {
+                        for (Map<String, String> raw : bucket) {
+                            try {
+                                switch (processRow(tenantId, raw, tenant, llmDown)) {
+                                    case "inserted"  -> inserted.incrementAndGet();
+                                    case "updated"   -> updated.incrementAndGet();
+                                    case "unchanged" -> unchanged.incrementAndGet();
+                                    default          -> failed.incrementAndGet();
+                                }
+                            } catch (LlmUnavailableException e) {
+                                failed.incrementAndGet();
+                                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
+                                        "error", "OpenAI API unavailable"));
+                                log.warn("LLM unavailable for row {}: {}",
+                                        raw.get("full_name"), e.getMessage());
+                            } catch (AmbiguousMatchException e) {
+                                failed.incrementAndGet();
+                                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
+                                        "error", "AMBIGUOUS_NAME"));
+                            } catch (Exception e) {
+                                failed.incrementAndGet();
+                                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
+                                        "error", e.getMessage()));
+                                log.warn("Row processing error: {}", e.getMessage());
+                            } finally {
+                                processed.incrementAndGet();
+                            }
+                        }
+                    } finally {
+                        com.alumindex.common.TenantContext.clear();
+                        latch.countDown();
+                    }
+                });
             }
 
-            processed++;
-            // live progress for the UI — every 5 rows to limit extra round trips
-            if (processed % 5 == 0) {
-                batch.setProcessedCount(processed);
-                batch.setInsertedCount(inserted);
-                batch.setUpdatedCount(updated);
-                batch.setUnchangedCount(unchanged);
-                batch.setFailedCount(failed);
-                batchRepo.save(batch);
+            // Single-writer progress: only this thread mutates/saves the batch
+            // entity, so the shared JPA entity is never touched by two threads.
+            while (!latch.await(750, TimeUnit.MILLISECONDS)) {
+                saveProgress(batch, processed, inserted, updated, unchanged, failed);
             }
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } finally {
+            pool.shutdown();
         }
 
         // non-fatal, but operators must see it (Overview + import card)
@@ -86,16 +127,55 @@ public class PipelineService {
                     "error", "OpenAI API unavailable — fallback normalisation used (check quota)"));
         }
 
-        batch.setRecordCount(rows.size());
-        batch.setProcessedCount(processed);
-        batch.setInsertedCount(inserted);
-        batch.setUpdatedCount(updated);
-        batch.setUnchangedCount(unchanged);
-        batch.setFailedCount(failed);
+        batch.setRecordCount(total);
+        batch.setProcessedCount(processed.get());
+        batch.setInsertedCount(inserted.get());
+        batch.setUpdatedCount(updated.get());
+        batch.setUnchangedCount(unchanged.get());
+        batch.setFailedCount(failed.get());
         batch.setStatus(ImportBatch.Status.completed);
-        batch.setErrorLog(errorLog.isEmpty() ? null : errorLog);
+        batch.setErrorLog(errorLog.isEmpty() ? null : new ArrayList<>(errorLog));
         batchRepo.save(batch);
-        log.info("Batch {} completed: +{} ~{} ={} !{}", batchId, inserted, updated, unchanged, failed);
+        log.info("Batch {} completed: +{} ~{} ={} !{}", batchId,
+                inserted.get(), updated.get(), unchanged.get(), failed.get());
+    }
+
+    /** Live progress flush — runs only on the orchestrator thread (single writer). */
+    private void saveProgress(ImportBatch batch, AtomicInteger processed, AtomicInteger inserted,
+                              AtomicInteger updated, AtomicInteger unchanged, AtomicInteger failed) {
+        batch.setProcessedCount(processed.get());
+        batch.setInsertedCount(inserted.get());
+        batch.setUpdatedCount(updated.get());
+        batch.setUnchangedCount(unchanged.get());
+        batch.setFailedCount(failed.get());
+        batchRepo.save(batch);
+    }
+
+    /** Buckets rows so all rows for the same person share a bucket (processed in order). */
+    private List<List<Map<String, String>>> partitionByIdentity(
+            List<Map<String, String>> rows, int buckets) {
+        var out = new ArrayList<List<Map<String, String>>>(buckets);
+        for (int i = 0; i < buckets; i++) out.add(new ArrayList<>());
+        for (var raw : rows) {
+            out.get(Math.floorMod(identityKey(raw).hashCode(), buckets)).add(raw);
+        }
+        return out;
+    }
+
+    /**
+     * Stable key for the person a row refers to, mirroring the matcher's keys:
+     * linkedin_url first, else name (+ grad year). Rows with no identity can't
+     * collide as "the same person", so they're spread for load balance.
+     */
+    private static String identityKey(Map<String, String> raw) {
+        String li = raw.getOrDefault("linkedin_url", "").trim().toLowerCase(Locale.ROOT);
+        if (!li.isBlank()) return "li:" + li;
+        String name = stripTitles(firstNonBlank(raw, "full_name"));
+        if (name != null) {
+            return "nm:" + name.toLowerCase(Locale.ROOT)
+                    + "|" + raw.getOrDefault("education_end_year", "").trim();
+        }
+        return "anon:" + System.identityHashCode(raw);
     }
 
     @Transactional

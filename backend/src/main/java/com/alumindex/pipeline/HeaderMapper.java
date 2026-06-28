@@ -39,11 +39,20 @@ public class HeaderMapper {
 
     private static final Map<String, String> SYNONYMS = buildSynonyms();
 
+    /** Alumni-domain fields that distinguish a graduate dataset from an unrelated file. */
+    private static final Set<String> ALUMNI_SIGNALS = Set.of(
+            "linkedin_url", "employment_title", "employment_company",
+            "company_standardized_name", "company_industry", "company_size",
+            "company_type", "employment_start_year", "employment_start_month",
+            "education_degree", "education_major", "education_end_year",
+            "university_name");
+
     public List<Map<String, String>> mapRows(List<Map<String, String>> rows) {
         if (rows.isEmpty()) return rows;
 
         List<String> headers = new ArrayList<>(rows.get(0).keySet());
         Map<String, String> mapping = resolveMapping(headers, rows);
+        validateLooksLikeAlumni(mapping, headers, rows);
 
         String today = LocalDate.now().toString();
         var out = new ArrayList<Map<String, String>>(rows.size());
@@ -97,6 +106,37 @@ public class HeaderMapper {
                     + headers);
         }
         return mapping;
+    }
+
+    /**
+     * Guards against non-alumni uploads (UC004). A name column alone is ambiguous —
+     * accounting, contact and inventory files often have one too. Files that already
+     * map ≥2 alumni-specific fields are accepted outright (no extra cost); otherwise
+     * the headers and a few sample rows are sent to the LLM to confirm the file is
+     * alumni data, and it is rejected with a clear message if not. If the classifier
+     * is unreachable we accept on the name signal rather than block a valid import.
+     */
+    private void validateLooksLikeAlumni(Map<String, String> mapping,
+                                         List<String> headers,
+                                         List<Map<String, String>> rows) {
+        long signals = mapping.values().stream().distinct()
+                .filter(ALUMNI_SIGNALS::contains).count();
+        if (signals >= 2) return; // unmistakably alumni — no LLM needed
+
+        try {
+            var c = llm.classifyAlumniFile(headers, rows.subList(0, Math.min(3, rows.size())));
+            if (!c.isAlumni()) {
+                String type = blank(c.detectedType()) ? "" : " It looks like a " + c.detectedType() + " file.";
+                String why  = blank(c.reason())       ? "" : " " + c.reason();
+                throw new IllegalArgumentException(
+                        "This doesn't appear to be an alumni file." + type + why
+                        + " Please upload alumni/graduate records (with details such as "
+                        + "graduation year, university, employer, job title or LinkedIn).");
+            }
+        } catch (LlmNormalisationService.LlmUnavailableException e) {
+            log.warn("Alumni-file classification unavailable, accepting on name signal: {}",
+                    e.getMessage());
+        }
     }
 
     private static boolean hasNameSignal(Set<String> mapped) {

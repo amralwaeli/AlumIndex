@@ -7,6 +7,10 @@ spring:
     username: ${DB_USERNAME:postgres}
     password: ${DB_PASSWORD:postgres}
     driver-class-name: org.postgresql.Driver
+    hikari:
+      # Must exceed alumindex.import.concurrency so parallel import workers,
+      # the progress writer, and live status-poll requests all get a connection.
+      maximum-pool-size: ${DB_POOL_SIZE:15}
 
   jpa:
     hibernate:
@@ -45,6 +49,10 @@ alumindex:
     api-key: ${OPENAI_API_KEY:}
     model: gpt-4o-mini
     temperature: 0
+  import:
+    # Parallel rows normalised at once. Higher = faster imports, but stay
+    # under spring.datasource.hikari.maximum-pool-size and your OpenAI rate tier.
+    concurrency: ${IMPORT_CONCURRENCY:8}
   frontend:
     origin: ${FRONTEND_ORIGIN:http://localhost:5173}
 

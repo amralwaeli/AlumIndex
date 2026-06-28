@@ -1,0 +1,101 @@
+package com.alumindex.pipeline;
+
+import com.alumindex.entity.ImportBatch;
+import com.alumindex.entity.Tenant;
+import com.alumindex.repository.AlumniRepository;
+import com.alumindex.repository.ImportBatchRepository;
+import com.alumindex.repository.TenantRepository;
+import org.junit.jupiter.api.Test;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.test.context.SpringBootTest;
+import org.springframework.boot.test.mock.mockito.MockBean;
+import org.springframework.test.context.ActiveProfiles;
+
+import java.math.BigDecimal;
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+import java.util.UUID;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.Mockito.when;
+
+/**
+ * End-to-end verification of the parallel import pipeline against in-memory H2.
+ * The OpenAI call is mocked, so this runs at zero API cost and never touches Supabase.
+ * Proves: (1) rows are processed concurrently (wall-clock << sequential time),
+ * (2) duplicate rows for the same person never create duplicate alumni (race fix),
+ * (3) counts remain correct.
+ */
+@SpringBootTest
+@ActiveProfiles("test")
+class PipelineServiceConcurrencyTest {
+
+    @Autowired PipelineService pipeline;
+    @Autowired TenantRepository tenantRepo;
+    @Autowired AlumniRepository alumniRepo;
+    @Autowired ImportBatchRepository batchRepo;
+
+    @MockBean LlmNormalisationService llm; // stubbed → no real OpenAI calls, $0 cost
+
+    @Test
+    void parallel_import_has_no_duplicate_inserts_and_runs_concurrently() throws Exception {
+        // Stub the LLM: echo full_name and add ~120ms latency to mimic a real API round-trip.
+        when(llm.normalise(anyMap())).thenAnswer(inv -> {
+            Map<String, String> raw = inv.getArgument(0);
+            Thread.sleep(120);
+            return new LlmNormalisationService.NormalisedRow(
+                    raw.get("full_name"), "Acme", "Engineer",
+                    "Senior", "Technology", "Kuala Lumpur", new BigDecimal("0.90"));
+        });
+
+        Tenant tenant = tenantRepo.save(Tenant.builder()
+                .institutionName("Test University")
+                .adminName("Admin")
+                .adminEmail("admin-" + UUID.randomUUID() + "@test.edu")
+                .build());
+
+        // 50 rows = 25 unique people, each appearing twice (deliberate in-file duplicates).
+        List<Map<String, String>> rows = new ArrayList<>();
+        for (int i = 0; i < 25; i++) {
+            Map<String, String> r = new LinkedHashMap<>();
+            r.put("full_name", "Person " + i);
+            r.put("education_end_year", "2020");
+            rows.add(new LinkedHashMap<>(r));
+            rows.add(new LinkedHashMap<>(r)); // duplicate of the same person
+        }
+
+        ImportBatch batch = batchRepo.save(ImportBatch.builder()
+                .tenant(tenant).filename("test.csv").recordCount(rows.size()).build());
+
+        long start = System.currentTimeMillis();
+        pipeline.runAsync(tenant.getId(), batch.getId(), rows, tenant);
+        ImportBatch done = awaitCompletion(batch.getId(), 30_000);
+        long elapsedMs = System.currentTimeMillis() - start;
+
+        assertThat(done.getStatus()).isEqualTo(ImportBatch.Status.completed);
+        assertThat(done.getProcessedCount()).isEqualTo(50);
+        assertThat(done.getFailedCount()).isZero();
+        // 25 unique people inserted; the 25 duplicates matched their first insert.
+        assertThat(done.getInsertedCount()).isEqualTo(25);
+        // CRITICAL: the duplicate-race fix → exactly 25 alumni rows, never 50.
+        assertThat(alumniRepo.count()).isEqualTo(25L);
+        // 50 rows x 120ms = 6s if sequential; with parallel workers it must finish far sooner.
+        assertThat(elapsedMs).isLessThan(3_000L);
+
+        System.out.printf("[PipelineServiceConcurrencyTest] 50 rows (25 unique) in %d ms; alumni=%d%n",
+                elapsedMs, alumniRepo.count());
+    }
+
+    private ImportBatch awaitCompletion(UUID batchId, long timeoutMs) throws InterruptedException {
+        long deadline = System.currentTimeMillis() + timeoutMs;
+        while (System.currentTimeMillis() < deadline) {
+            ImportBatch b = batchRepo.findById(batchId).orElseThrow();
+            if (b.getStatus() == ImportBatch.Status.completed) return b;
+            Thread.sleep(100);
+        }
+        throw new AssertionError("import did not complete within " + timeoutMs + "ms");
+    }
+}

@@ -27,11 +27,19 @@ class HeaderMapperTest {
         return m;
     }
 
+    /** For low-signal files the mapper asks the LLM to confirm it is alumni data. */
+    private void stubClassifiedAsAlumni() {
+        when(llm.classifyAlumniFile(anyList(), anyList()))
+                .thenReturn(new LlmNormalisationService.FileClassification(true, "alumni", "ok"));
+    }
+
     @Test
     void canonical_headers_pass_through_unchanged() {
+        // includes 2 alumni-signal fields → classification is skipped (no LLM call)
         var out = mapper().mapRows(List.of(row(
                 "full_name", "Alice Smith", "first_name", "Alice",
-                "last_name", "Smith", "captured_date", "2024-01-01")));
+                "last_name", "Smith", "captured_date", "2024-01-01",
+                "education_end_year", "2020", "university_name", "Tech U")));
 
         assertThat(out).hasSize(1);
         assertThat(out.get(0)).containsEntry("full_name", "Alice Smith")
@@ -55,7 +63,17 @@ class HeaderMapperTest {
     }
 
     @Test
+    void file_with_enough_alumni_signals_skips_classification() {
+        var out = mapper().mapRows(List.of(row(
+                "name", "Bob", "company", "Acme", "graduation_year", "2019")));
+
+        assertThat(out).hasSize(1);
+        verify(llm, never()).classifyAlumniFile(anyList(), anyList());
+    }
+
+    @Test
     void full_name_derived_from_first_and_last() {
+        stubClassifiedAsAlumni();
         var out = mapper().mapRows(List.of(row(
                 "First Name", "Citra", "Surname", "Dewi")));
 
@@ -64,6 +82,7 @@ class HeaderMapperTest {
 
     @Test
     void first_and_last_derived_from_full_name() {
+        stubClassifiedAsAlumni();
         var out = mapper().mapRows(List.of(row("name", "Dana Lee Wong")));
 
         var r = out.get(0);
@@ -73,6 +92,7 @@ class HeaderMapperTest {
 
     @Test
     void missing_captured_date_defaults_to_today() {
+        stubClassifiedAsAlumni();
         var out = mapper().mapRows(List.of(row("full_name", "Eve Lim")));
 
         assertThat(out.get(0)).containsEntry("captured_date", LocalDate.now().toString());
@@ -80,13 +100,15 @@ class HeaderMapperTest {
 
     @Test
     void bom_prefixed_header_is_recognised() {
-        var out = mapper().mapRows(List.of(row("\uFEFFfull_name", "Farah Aziz")));
+        stubClassifiedAsAlumni();
+        var out = mapper().mapRows(List.of(row("﻿full_name", "Farah Aziz")));
 
         assertThat(out.get(0)).containsEntry("full_name", "Farah Aziz");
     }
 
     @Test
     void blank_rows_are_dropped() {
+        stubClassifiedAsAlumni();
         var out = mapper().mapRows(List.of(
                 row("name", "Gina Ho"),
                 row("name", "  ")));
@@ -98,6 +120,7 @@ class HeaderMapperTest {
     void llm_fallback_maps_unrecognisable_headers() {
         when(llm.mapHeaders(anyList(), anyList()))
                 .thenReturn(Map.of("alumno", "full_name", "empresa", "employment_company"));
+        stubClassifiedAsAlumni();
 
         var out = mapper().mapRows(List.of(row("alumno", "Hugo Reyes", "empresa", "Acme")));
 
@@ -113,6 +136,31 @@ class HeaderMapperTest {
         assertThatThrownBy(() -> mapper().mapRows(List.of(row("foo", "1", "bar", "2"))))
                 .isInstanceOf(IllegalArgumentException.class)
                 .hasMessageContaining("name column");
+    }
+
+    @Test
+    void non_alumni_file_is_rejected_with_clear_message() {
+        when(llm.classifyAlumniFile(anyList(), anyList()))
+                .thenReturn(new LlmNormalisationService.FileClassification(
+                        false, "accounting", "Columns are invoice amounts, not people."));
+
+        // "name" maps (any file can have one); amount/invoice_no are unrelated → low signal
+        assertThatThrownBy(() -> mapper().mapRows(List.of(row(
+                "name", "Acme Corp", "amount", "1200", "invoice_no", "INV-1"))))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("alumni")
+                .hasMessageContaining("accounting");
+    }
+
+    @Test
+    void low_signal_file_accepted_when_classifier_unavailable() {
+        // classifier down → don't block a possibly-valid import
+        when(llm.classifyAlumniFile(anyList(), anyList()))
+                .thenThrow(new LlmNormalisationService.LlmUnavailableException("down", null));
+
+        var out = mapper().mapRows(List.of(row("full_name", "Iris Tan")));
+
+        assertThat(out).hasSize(1);
     }
 
     @Test

@@ -20,6 +20,9 @@ public class RlsConnectionProvider implements MultiTenantConnectionProvider<Stri
 
     private final DataSource dataSource;
 
+    /** RLS GUC is PostgreSQL-specific. Cached so non-Postgres DBs (e.g. H2 in tests) skip it. */
+    private volatile Boolean postgres;
+
     public RlsConnectionProvider(DataSource dataSource) {
         this.dataSource = dataSource;
     }
@@ -37,19 +40,38 @@ public class RlsConnectionProvider implements MultiTenantConnectionProvider<Stri
     @Override
     public Connection getConnection(String tenantId) throws SQLException {
         Connection conn = dataSource.getConnection();
-        try (var stmt = conn.createStatement()) {
-            String safeId = (tenantId != null) ? tenantId.replaceAll("[^a-fA-F0-9\\-]", "") : "";
-            stmt.execute("SET LOCAL app.current_tenant_id = '" + safeId + "'");
+        if (isPostgres(conn)) {
+            try (var stmt = conn.createStatement()) {
+                String safeId = (tenantId != null) ? tenantId.replaceAll("[^a-fA-F0-9\\-]", "") : "";
+                stmt.execute("SET LOCAL app.current_tenant_id = '" + safeId + "'");
+            }
         }
         return conn;
     }
 
     @Override
     public void releaseConnection(String tenantId, Connection connection) throws SQLException {
-        try (var stmt = connection.createStatement()) {
-            stmt.execute("SET LOCAL app.current_tenant_id = ''");
+        if (isPostgres(connection)) {
+            try (var stmt = connection.createStatement()) {
+                stmt.execute("SET LOCAL app.current_tenant_id = ''");
+            }
         }
         connection.close();
+    }
+
+    /** True when the live database is PostgreSQL (Supabase reports as such); cached after first check. */
+    private boolean isPostgres(Connection conn) throws SQLException {
+        Boolean p = postgres;
+        if (p == null) {
+            synchronized (this) {
+                if (postgres == null) {
+                    postgres = "PostgreSQL".equalsIgnoreCase(
+                            conn.getMetaData().getDatabaseProductName());
+                }
+                p = postgres;
+            }
+        }
+        return p;
     }
 
     @Override

@@ -6,6 +6,7 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.*;
 import org.springframework.stereotype.Service;
+import org.springframework.web.client.HttpStatusCodeException;
 import org.springframework.web.client.RestTemplate;
 
 import java.math.BigDecimal;
@@ -15,7 +16,10 @@ import java.util.Map;
 
 /**
  * Calls OpenAI gpt-4o-mini to normalise one raw CSV row into structured alumni fields.
- * Retry: exponential backoff 1 s → 2 s → 4 s (3 attempts).
+ * Retry: exponential backoff 1 → 2 → 4 s (3 attempts). HTTP 429/5xx are treated as
+ * transient and honour the Retry-After header so brief rate-limit bursts (common
+ * when the import runs many rows concurrently) recover instead of tripping the
+ * pipeline's circuit breaker and degrading to fallback normalisation.
  * On all-retry failure the row is marked failed and the pipeline continues.
  */
 @Service
@@ -88,12 +92,54 @@ public class LlmNormalisationService {
         }
     }
 
+    /** Outcome of the file-type sanity check. */
+    public record FileClassification(boolean isAlumni, String detectedType, String reason) {}
+
+    /**
+     * Confirms an uploaded file actually describes alumni/graduates rather than an
+     * unrelated dataset (accounting, invoices, inventory, generic contacts, …).
+     * Used only for low-signal files where header mapping alone is inconclusive.
+     */
+    public FileClassification classifyAlumniFile(List<String> headers,
+                                                 List<Map<String, String>> sampleRows) {
+        String prompt = """
+            You validate files uploaded to a university ALUMNI management system.
+            An alumni file lists individual people (graduates), each with details such
+            as their name, graduation year, university, degree, employer, job title or
+            LinkedIn. Files about other domains — accounting, invoices, sales,
+            inventory, products, or generic contact lists — are NOT alumni files.
+            Decide which this is from the headers and sample rows.
+            Return ONLY JSON: {"is_alumni": true|false, "detected_type": "<short label>", "reason": "<one short sentence>"}.
+            Headers: %s
+            Sample rows: %s
+            """.formatted(headers, sampleRows);
+        try {
+            JsonNode data = new ObjectMapper().readTree(withRetries(prompt));
+            return new FileClassification(
+                    data.path("is_alumni").asBoolean(false),
+                    data.path("detected_type").asText(""),
+                    data.path("reason").asText(""));
+        } catch (LlmUnavailableException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new LlmUnavailableException("Failed to classify file: " + e.getMessage(), e);
+        }
+    }
+
     /** Runs one prompt with exponential backoff and returns the message content (fences stripped). */
     private String withRetries(String prompt) {
         Exception lastEx = null;
         for (int attempt = 0; attempt < BACKOFF_SECONDS.length; attempt++) {
             try {
                 return callOpenAi(prompt);
+            } catch (RateLimitException e) {
+                lastEx = e;
+                long wait = Math.max(BACKOFF_SECONDS[attempt], e.retryAfterSeconds);
+                log.warn("OpenAI rate-limited (HTTP {}) attempt {}/{} — waiting {}s",
+                        e.code, attempt + 1, BACKOFF_SECONDS.length, wait);
+                if (attempt < BACKOFF_SECONDS.length - 1) {
+                    sleep((int) wait);
+                }
             } catch (Exception e) {
                 lastEx = e;
                 log.warn("OpenAI attempt {}/{} failed: {}", attempt + 1, BACKOFF_SECONDS.length,
@@ -121,9 +167,19 @@ public class LlmNormalisationService {
                 )
         );
 
-        ResponseEntity<String> response = rest.exchange(
-                OPENAI_URL, HttpMethod.POST,
-                new HttpEntity<>(body, headers), String.class);
+        ResponseEntity<String> response;
+        try {
+            response = rest.exchange(
+                    OPENAI_URL, HttpMethod.POST,
+                    new HttpEntity<>(body, headers), String.class);
+        } catch (HttpStatusCodeException e) {
+            int code = e.getStatusCode().value();
+            // 429 (rate limit) and 5xx are transient → retry rather than fail the row
+            if (code == 429 || code >= 500) {
+                throw new RateLimitException(code, parseRetryAfter(e));
+            }
+            throw e; // 4xx like 401/403 are persistent (bad key/quota) → let it bubble
+        }
 
         ObjectMapper om = new ObjectMapper();
         try {
@@ -176,5 +232,28 @@ public class LlmNormalisationService {
 
     public static class LlmUnavailableException extends RuntimeException {
         public LlmUnavailableException(String msg, Throwable cause) { super(msg, cause); }
+    }
+
+    /** Transient OpenAI failure (HTTP 429 / 5xx) — retried with backoff, not surfaced as terminal. */
+    private static class RateLimitException extends RuntimeException {
+        final int code;
+        final long retryAfterSeconds;
+        RateLimitException(int code, long retryAfterSeconds) {
+            super("OpenAI HTTP " + code);
+            this.code = code;
+            this.retryAfterSeconds = retryAfterSeconds;
+        }
+    }
+
+    /** Reads the Retry-After response header (seconds); 0 if absent or unparseable. */
+    private static long parseRetryAfter(HttpStatusCodeException e) {
+        var headers = e.getResponseHeaders();
+        if (headers != null) {
+            String ra = headers.getFirst("Retry-After");
+            if (ra != null) {
+                try { return Long.parseLong(ra.trim()); } catch (NumberFormatException ignored) { }
+            }
+        }
+        return 0;
     }
 }
