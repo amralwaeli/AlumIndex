@@ -12,6 +12,8 @@ import org.springframework.boot.test.mock.mockito.MockBean;
 import org.springframework.test.context.ActiveProfiles;
 
 import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -82,13 +84,62 @@ class PipelineServiceConcurrencyTest {
         assertThat(done.getFailedCount()).isZero();
         // 25 unique people inserted; the 25 duplicates matched their first insert.
         assertThat(done.getInsertedCount()).isEqualTo(25);
-        // CRITICAL: the duplicate-race fix → exactly 25 alumni rows, never 50.
-        assertThat(alumniRepo.count()).isEqualTo(25L);
+        // CRITICAL: the duplicate-race fix → exactly 25 alumni rows for this tenant, never 50.
+        assertThat(alumniRepo.countByTenantId(tenant.getId())).isEqualTo(25L);
         // 50 rows x 120ms = 6s if sequential; with parallel workers it must finish far sooner.
         assertThat(elapsedMs).isLessThan(3_000L);
 
         System.out.printf("[PipelineServiceConcurrencyTest] 50 rows (25 unique) in %d ms; alumni=%d%n",
-                elapsedMs, alumniRepo.count());
+                elapsedMs, alumniRepo.countByTenantId(tenant.getId()));
+    }
+
+    @Test
+    void resumes_a_streamed_import_from_the_persisted_offset() throws Exception {
+        when(llm.normaliseBatch(anyList())).thenAnswer(inv -> {
+            List<Map<String, String>> batch = inv.getArgument(0);
+            return batch.stream()
+                    .map(raw -> new LlmNormalisationService.NormalisedRow(
+                            raw.get("full_name"), "Acme", "Engineer",
+                            "Senior", "Technology", "Kuala Lumpur", new BigDecimal("0.90")))
+                    .toList();
+        });
+
+        Tenant tenant = tenantRepo.save(Tenant.builder()
+                .institutionName("Resume University")
+                .adminName("Admin")
+                .adminEmail("admin-" + UUID.randomUUID() + "@test.edu")
+                .build());
+
+        // 10 distinct people (no LinkedIn) in a CSV the streaming path will read.
+        Path file = Files.createTempFile("resume-test-", ".csv");
+        var sb = new StringBuilder("full_name,education_end_year\n");
+        for (int i = 0; i < 10; i++) sb.append("Person ").append(i).append(",2020\n");
+        Files.writeString(file, sb.toString());
+
+        try {
+            // Simulate a crash after the first 4 rows were committed: counts + offset persisted.
+            ImportBatch batch = batchRepo.save(ImportBatch.builder()
+                    .tenant(tenant).filename("resume.csv").recordCount(10)
+                    .status(ImportBatch.Status.processing)
+                    .processedCount(4).insertedCount(4).nextOffset(4)
+                    .storageKey(file.toString())
+                    .build());
+
+            Map<String, String> mapping = Map.of(
+                    "full_name", "full_name", "education_end_year", "education_end_year");
+
+            pipeline.runAsync(tenant.getId(), batch.getId(), file, "resume.csv", mapping, tenant);
+            ImportBatch done = awaitCompletion(batch.getId(), 30_000);
+
+            // 4 prior + 6 resumed = 10 reported; only the 6 resumed rows are actually inserted.
+            assertThat(done.getInsertedCount()).isEqualTo(10);
+            assertThat(done.getProcessedCount()).isEqualTo(10);
+            assertThat(alumniRepo.countByTenantId(tenant.getId())).isEqualTo(6L);
+            assertThat(done.getStorageKey()).isNull();        // cleared when finished
+            assertThat(Files.exists(file)).isFalse();         // buffered file deleted
+        } finally {
+            Files.deleteIfExists(file);
+        }
     }
 
     private ImportBatch awaitCompletion(UUID batchId, long timeoutMs) throws InterruptedException {

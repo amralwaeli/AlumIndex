@@ -79,26 +79,35 @@ public class PipelineService {
         final UUID ctxTenant = com.alumindex.common.TenantContext.get();
         var errorLog = Collections.synchronizedList(new ArrayList<Object>());
         var llmDown  = new AtomicBoolean(false);
-        var c        = new Counters();
+        var c        = seedCounters(batch);   // restore tallies when resuming an interrupted run
         int workers  = Math.max(1, concurrency);
         var pool      = Executors.newFixedThreadPool(workers);
         var normCache = new java.util.concurrent.ConcurrentHashMap<String, NormalisedRow>();
         String today  = LocalDate.now().toString();
 
+        // Resume: skip the mapped rows already committed in a prior run, then checkpoint the
+        // mapped-row offset after each chunk so a restart continues from exactly here.
+        final int[] toSkip   = { batch.getNextOffset() };
+        final int[] consumed = { batch.getNextOffset() };
         var chunk = new ArrayList<Map<String, String>>(chunkSize);
         try {
             parser.stream(file, filename, new ArrayList<>(), raw -> {
                 Map<String, String> mapped = headerMapper.mapRow(raw, mapping, today);
                 if (mapped == null) return;          // all-blank row dropped
+                if (toSkip[0] > 0) { toSkip[0]--; return; }   // already processed before restart
                 chunk.add(mapped);
                 if (chunk.size() >= chunkSize) {
                     processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant, normCache);
+                    consumed[0] += chunk.size();
+                    batch.setNextOffset(consumed[0]);
                     saveProgress(batch, c);
                     chunk.clear();
                 }
             });
             if (!chunk.isEmpty()) {
                 processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant, normCache);
+                consumed[0] += chunk.size();
+                batch.setNextOffset(consumed[0]);
                 chunk.clear();
             }
         } catch (Exception e) {
@@ -286,6 +295,17 @@ public class PipelineService {
         }
     }
 
+    /** Restores the running tallies from a (possibly partially-processed) batch so resume continues. */
+    private static Counters seedCounters(ImportBatch batch) {
+        var c = new Counters();
+        c.processed.set(batch.getProcessedCount());
+        c.inserted.set(batch.getInsertedCount());
+        c.updated.set(batch.getUpdatedCount());
+        c.unchanged.set(batch.getUnchangedCount());
+        c.failed.set(batch.getFailedCount());
+        return c;
+    }
+
     /** Live progress flush — runs only on the orchestrator thread (single writer). */
     private void saveProgress(ImportBatch batch, Counters c) {
         batch.setProcessedCount(c.processed.get());
@@ -312,6 +332,7 @@ public class PipelineService {
         batch.setFailedCount(c.failed.get());
         batch.setStatus(status);
         batch.setErrorLog(errorLog.isEmpty() ? null : new ArrayList<>(errorLog));
+        batch.setStorageKey(null);   // run finished → no longer resumable; stored file is deleted
         batchRepo.save(batch);
     }
 

@@ -35,4 +35,12 @@ public interface ImportBatchRepository extends JpaRepository<ImportBatch, UUID> 
 
     @Query("SELECT SUM(b.failedCount) FROM ImportBatch b WHERE b.uploadedAt >= :start AND b.uploadedAt < :end")
     Long sumFailedRowsThisMonth(@Param("start") Instant start, @Param("end") Instant end);
+
+    /** Imports left mid-run with their buffered file still recorded — candidates to resume on startup. */
+    @Query("""
+        SELECT b FROM ImportBatch b
+        JOIN FETCH b.tenant
+        WHERE b.status = :status AND b.storageKey IS NOT NULL
+        """)
+    List<ImportBatch> findResumable(@Param("status") ImportBatch.Status status);
 }

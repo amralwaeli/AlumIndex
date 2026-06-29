@@ -67,5 +67,14 @@ public class ImportBatch {
     @Column(name = "error_log", columnDefinition = "jsonb")
     private List<Object> errorLog;
 
+    /** Path to the buffered upload; kept until the import finishes so it can resume after a restart. */
+    @Column(name = "storage_key")
+    private String storageKey;
+
+    /** Mapped-row offset of the next chunk to process; lets an interrupted import resume. */
+    @Builder.Default
+    @Column(name = "next_offset", nullable = false)
+    private int nextOffset = 0;
+
     public enum Status { processing, validated, completed, failed }
 }

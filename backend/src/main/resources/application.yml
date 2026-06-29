@@ -57,6 +57,10 @@ alumindex:
     # Rows normalised per OpenAI call. Higher = fewer/cheaper calls but larger prompts;
     # ~20 cuts a 100K import from 100K calls to ~5K.
     llm-batch-size: ${IMPORT_LLM_BATCH_SIZE:20}
+    # Where uploads are buffered during import. For resume-after-restart to work this must
+    # survive a restart (a persistent disk / mounted volume); blank = OS temp dir (fine for a
+    # single uninterrupted run, but ephemeral on Render free tier).
+    storage-dir: ${IMPORT_STORAGE_DIR:}
   mail:
     # Email is sent via Resend's HTTPS API (not SMTP) so it works on hosts that
     # block outbound SMTP ports, e.g. Render's free tier. Get an API key at
