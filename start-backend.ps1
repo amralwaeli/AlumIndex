@@ -7,8 +7,8 @@ foreach ($p in $pids) {
 }
 if ($pids) { Start-Sleep -Seconds 2 }
 
-$env:MAIL_FROM = "amralwaeli9@gmail.com"   # must be a Brevo-verified sender
-$env:BREVO_API_KEY = ""                     # paste your Brevo API key here to send mail locally
+$env:MAIL_FROM = "no-reply@alumindex.org"   # must be on a Resend-verified domain
+$env:RESEND_API_KEY = ""                     # paste your Resend API key here to send mail locally
 $env:SPRING_PROFILES_ACTIVE = "local"
 
 $jar = "$PSScriptRoot\backend\target\alumindex-backend-1.0.0-SNAPSHOT.jar"

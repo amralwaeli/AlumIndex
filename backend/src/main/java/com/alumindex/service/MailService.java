@@ -19,17 +19,17 @@ import java.time.Instant;
 @Slf4j
 public class MailService {
 
-    // Brevo (Sendinblue) transactional email API — sent over HTTPS so it works on
-    // hosts that block outbound SMTP ports (e.g. Render's free tier).
-    private static final String BREVO_ENDPOINT = "https://api.brevo.com/v3/smtp/email";
+    // Resend transactional email API — sent over HTTPS so it works on hosts that
+    // block outbound SMTP ports (e.g. Render's free tier).
+    private static final String RESEND_ENDPOINT = "https://api.resend.com/emails";
 
     private final HttpClient http = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(10))
             .build();
     private final ObjectMapper json = new ObjectMapper();
 
-    @Value("${alumindex.mail.brevo-api-key:}")
-    private String brevoApiKey;
+    @Value("${alumindex.mail.resend-api-key:}")
+    private String resendApiKey;
 
     @Value("${alumindex.mail.from:}")
     private String fromAddress;
@@ -135,35 +135,37 @@ public class MailService {
     // ── Core send — throws on any failure ────────────────────────────────────
 
     private void send(String to, String subject, String body) {
-        if (brevoApiKey == null || brevoApiKey.isBlank()) {
+        if (resendApiKey == null || resendApiKey.isBlank()) {
             throw new IllegalStateException(
-                "BREVO_API_KEY is not configured. Add alumindex.mail.brevo-api-key to your profile.");
+                "RESEND_API_KEY is not configured. Add alumindex.mail.resend-api-key to your profile.");
         }
         if (fromAddress == null || fromAddress.isBlank()) {
             throw new IllegalStateException(
                 "MAIL_FROM (sender address) is not configured. Add alumindex.mail.from to your profile.");
         }
         try {
-            ObjectNode payload = json.createObjectNode();
-            ObjectNode sender = payload.putObject("sender");
-            sender.put("email", fromAddress);
-            sender.put("name", fromName);
-            payload.putArray("to").addObject().put("email", to);
-            payload.put("subject", subject);
-            payload.put("textContent", body);
+            // Resend's "from" accepts a display name: "AlumIndex <no-reply@alumindex.org>".
+            String from = (fromName == null || fromName.isBlank())
+                    ? fromAddress
+                    : fromName + " <" + fromAddress + ">";
 
-            HttpRequest req = HttpRequest.newBuilder(URI.create(BREVO_ENDPOINT))
+            ObjectNode payload = json.createObjectNode();
+            payload.put("from", from);
+            payload.putArray("to").add(to);
+            payload.put("subject", subject);
+            payload.put("text", body);
+
+            HttpRequest req = HttpRequest.newBuilder(URI.create(RESEND_ENDPOINT))
                     .timeout(Duration.ofSeconds(15))
-                    .header("api-key", brevoApiKey)
+                    .header("authorization", "Bearer " + resendApiKey)
                     .header("content-type", "application/json")
-                    .header("accept", "application/json")
                     .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(payload)))
                     .build();
 
             HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() / 100 != 2) {
                 throw new IllegalStateException(
-                    "Brevo API returned HTTP " + resp.statusCode() + ": " + resp.body());
+                    "Resend API returned HTTP " + resp.statusCode() + ": " + resp.body());
             }
             log.debug("Email sent to {}: {}", to, subject);
         } catch (IOException e) {

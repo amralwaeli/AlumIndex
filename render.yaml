@@ -19,9 +19,9 @@ services:
         value: jdbc:postgresql://aws-1-ap-northeast-1.pooler.supabase.com:6543/postgres?prepareThreshold=0
       - key: DB_USERNAME
         value: postgres.zdhjxnztwsfkgagavxcc
-      # Sender address for outgoing email — must be a Brevo-verified sender
+      # Sender address for outgoing email — must be on a Resend-verified domain
       - key: MAIL_FROM
-        value: amralwaeli9@gmail.com
+        value: no-reply@alumindex.org
       # Secrets — Render prompts for these at deploy time (never stored in git)
       - key: DB_PASSWORD
         sync: false
@@ -29,6 +29,6 @@ services:
         sync: false
       - key: OPENAI_API_KEY
         sync: false
-      # Brevo transactional-email API key (sent over HTTPS; SMTP is blocked on free tier)
-      - key: BREVO_API_KEY
+      # Resend transactional-email API key (sent over HTTPS; SMTP is blocked on free tier)
+      - key: RESEND_API_KEY
         sync: false
