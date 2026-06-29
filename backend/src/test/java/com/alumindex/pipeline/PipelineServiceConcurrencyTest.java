@@ -19,7 +19,7 @@ import java.util.Map;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
-import static org.mockito.ArgumentMatchers.anyMap;
+import static org.mockito.ArgumentMatchers.anyList;
 import static org.mockito.Mockito.when;
 
 /**
@@ -42,13 +42,15 @@ class PipelineServiceConcurrencyTest {
 
     @Test
     void parallel_import_has_no_duplicate_inserts_and_runs_concurrently() throws Exception {
-        // Stub the LLM: echo full_name and add ~120ms latency to mimic a real API round-trip.
-        when(llm.normalise(anyMap())).thenAnswer(inv -> {
-            Map<String, String> raw = inv.getArgument(0);
+        // Stub the LLM: one batched call per ~20 rows, ~120ms latency to mimic an API round-trip.
+        when(llm.normaliseBatch(anyList())).thenAnswer(inv -> {
+            List<Map<String, String>> batch = inv.getArgument(0);
             Thread.sleep(120);
-            return new LlmNormalisationService.NormalisedRow(
-                    raw.get("full_name"), "Acme", "Engineer",
-                    "Senior", "Technology", "Kuala Lumpur", new BigDecimal("0.90"));
+            return batch.stream()
+                    .map(raw -> new LlmNormalisationService.NormalisedRow(
+                            raw.get("full_name"), "Acme", "Engineer",
+                            "Senior", "Technology", "Kuala Lumpur", new BigDecimal("0.90")))
+                    .toList();
         });
 
         Tenant tenant = tenantRepo.save(Tenant.builder()

@@ -54,6 +54,9 @@ alumindex:
     # Rows held in memory at once. Keeps peak heap bounded regardless of file size;
     # processed as a unit (dedupe + bucket + flush progress) before the next chunk.
     chunk-size: ${IMPORT_CHUNK_SIZE:500}
+    # Rows normalised per OpenAI call. Higher = fewer/cheaper calls but larger prompts;
+    # ~20 cuts a 100K import from 100K calls to ~5K.
+    llm-batch-size: ${IMPORT_LLM_BATCH_SIZE:20}
   mail:
     # Email is sent via Resend's HTTPS API (not SMTP) so it works on hosts that
     # block outbound SMTP ports, e.g. Render's free tier. Get an API key at

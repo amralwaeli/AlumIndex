@@ -56,6 +56,21 @@ public class LlmNormalisationService {
     }
 
     /**
+     * Normalises several rows in a SINGLE OpenAI call (returns a JSON array), cutting the number
+     * of round-trips by ~{@code rows.size()}×. The returned list is aligned by index with the input;
+     * an element is {@code null} if the model omitted/garbled that record, so the caller can fall
+     * back to deterministic normalisation for just that row. Throws {@link LlmUnavailableException}
+     * (via {@link #withRetries}) only when OpenAI itself is unreachable.
+     */
+    public List<NormalisedRow> normaliseBatch(List<Map<String, String>> rows) {
+        if (rows == null || rows.isEmpty()) return List.of();
+        if (rows.size() == 1) {
+            return java.util.Collections.singletonList(normalise(rows.get(0)));
+        }
+        return parseBatchResponse(withRetries(buildBatchPrompt(rows)), rows.size());
+    }
+
+    /**
      * Asks the LLM to map arbitrary CSV headers onto the canonical schema.
      * Returns originalHeader → canonicalField; headers the model can't place
      * are omitted. Used as a fallback when synonym matching finds no name column.
@@ -194,20 +209,44 @@ public class LlmNormalisationService {
 
     private NormalisedRow parseResponse(String content) {
         try {
-            ObjectMapper om = new ObjectMapper();
-            JsonNode data = om.readTree(content);
-            return new NormalisedRow(
-                    text(data, "full_name"),
-                    text(data, "employer"),
-                    text(data, "job_title"),
-                    text(data, "seniority"),
-                    text(data, "industry"),
-                    text(data, "location"),
-                    new BigDecimal(data.path("confidence_score").asText("0.7"))
-            );
+            return toNormalised(new ObjectMapper().readTree(content));
         } catch (Exception e) {
             throw new RuntimeException("Failed to parse OpenAI response: " + e.getMessage(), e);
         }
+    }
+
+    /** Parses a JSON array of N normalised objects; index-aligned with input, null per bad element. */
+    private List<NormalisedRow> parseBatchResponse(String content, int expected) {
+        var out = new java.util.ArrayList<NormalisedRow>(expected);
+        JsonNode arr;
+        try {
+            arr = new ObjectMapper().readTree(content);
+        } catch (Exception e) {
+            for (int i = 0; i < expected; i++) out.add(null);   // whole batch unparseable → fall back per row
+            return out;
+        }
+        for (int i = 0; i < expected; i++) {
+            JsonNode node = arr.isArray() && i < arr.size() ? arr.get(i) : null;
+            out.add(node != null && node.isObject() ? toNormalised(node) : null);
+        }
+        return out;
+    }
+
+    private static NormalisedRow toNormalised(JsonNode data) {
+        BigDecimal confidence;
+        try {
+            confidence = new BigDecimal(data.path("confidence_score").asText("0.7"));
+        } catch (NumberFormatException e) {
+            confidence = new BigDecimal("0.7");
+        }
+        return new NormalisedRow(
+                text(data, "full_name"),
+                text(data, "employer"),
+                text(data, "job_title"),
+                text(data, "seniority"),
+                text(data, "industry"),
+                text(data, "location"),
+                confidence);
     }
 
     private static String text(JsonNode n, String field) {
@@ -222,6 +261,25 @@ public class LlmNormalisationService {
             Strip titles from full_name (Dr., Prof., Mr., Mrs., etc.).
             Raw record:
             """ + row.toString();
+    }
+
+    /** One prompt that normalises N records and asks for a JSON array, one object per record in order. */
+    private static String buildBatchPrompt(List<Map<String, String>> rows) {
+        String recordsJson;
+        try {
+            recordsJson = new ObjectMapper().writeValueAsString(rows);
+        } catch (Exception e) {
+            recordsJson = rows.toString();
+        }
+        return """
+            Normalise EACH of the following alumni records. Return ONLY a JSON array containing exactly
+            one object per input record, in the SAME ORDER, each with these fields:
+            full_name, employer, job_title, seniority (one of: Junior, Mid-Level, Senior, Lead, Manager, Director, VP, C-Suite),
+            industry (e.g. Technology, Finance, Healthcare, Energy, etc.), location (city/country), confidence_score (0.0-1.0).
+            Strip titles from full_name (Dr., Prof., Mr., Mrs., etc.).
+            The array length MUST equal the number of input records.
+            Records (JSON array):
+            """ + recordsJson;
     }
 
     private static void sleep(int seconds) {

@@ -52,6 +52,10 @@ public class PipelineService {
     @Value("${alumindex.import.chunk-size:500}")
     private int chunkSize;
 
+    /** Rows normalised per OpenAI call. Higher = fewer/cheaper calls, larger prompts. */
+    @Value("${alumindex.import.llm-batch-size:20}")
+    private int llmBatchSize;
+
     /** Per-run tallies, shared across chunk workers via atomics. */
     private static final class Counters {
         final AtomicInteger inserted  = new AtomicInteger();
@@ -77,8 +81,9 @@ public class PipelineService {
         var llmDown  = new AtomicBoolean(false);
         var c        = new Counters();
         int workers  = Math.max(1, concurrency);
-        var pool     = Executors.newFixedThreadPool(workers);
-        String today = LocalDate.now().toString();
+        var pool      = Executors.newFixedThreadPool(workers);
+        var normCache = new java.util.concurrent.ConcurrentHashMap<String, NormalisedRow>();
+        String today  = LocalDate.now().toString();
 
         var chunk = new ArrayList<Map<String, String>>(chunkSize);
         try {
@@ -87,13 +92,13 @@ public class PipelineService {
                 if (mapped == null) return;          // all-blank row dropped
                 chunk.add(mapped);
                 if (chunk.size() >= chunkSize) {
-                    processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant);
+                    processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant, normCache);
                     saveProgress(batch, c);
                     chunk.clear();
                 }
             });
             if (!chunk.isEmpty()) {
-                processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant);
+                processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant, normCache);
                 chunk.clear();
             }
         } catch (Exception e) {
@@ -125,11 +130,12 @@ public class PipelineService {
         var llmDown  = new AtomicBoolean(false);
         var c        = new Counters();
         int workers  = Math.max(1, concurrency);
-        var pool     = Executors.newFixedThreadPool(workers);
+        var pool      = Executors.newFixedThreadPool(workers);
+        var normCache = new java.util.concurrent.ConcurrentHashMap<String, NormalisedRow>();
         try {
             for (int i = 0; i < rows.size(); i += chunkSize) {
                 var chunk = new ArrayList<>(rows.subList(i, Math.min(rows.size(), i + chunkSize)));
-                processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant);
+                processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant, normCache);
                 saveProgress(batch, c);
             }
         } finally {
@@ -147,7 +153,8 @@ public class PipelineService {
      */
     private void processChunk(List<Map<String, String>> chunk, UUID tenantId, Tenant tenant,
                               AtomicBoolean llmDown, ExecutorService pool, int workers,
-                              Counters c, List<Object> errorLog, UUID ctxTenant) {
+                              Counters c, List<Object> errorLog, UUID ctxTenant,
+                              Map<String, NormalisedRow> normCache) {
         var seen   = new HashSet<String>();
         var unique = new ArrayList<Map<String, String>>(chunk.size());
         for (var raw : chunk) {
@@ -160,6 +167,10 @@ public class PipelineService {
         }
         if (unique.isEmpty()) return;
 
+        // Step 2 — normalise the whole chunk up-front: far fewer OpenAI round-trips (batched),
+        // a whole-row cache across chunks, and a per-row deterministic fallback.
+        Map<String, NormalisedRow> normByKey = normaliseChunk(unique, llmDown, pool, normCache);
+
         int n = Math.max(1, Math.min(workers, unique.size()));
         List<List<Map<String, String>>> buckets = partitionByIdentity(unique, n);
         var latch = new CountDownLatch(buckets.size());
@@ -167,7 +178,11 @@ public class PipelineService {
             pool.submit(() -> {
                 if (ctxTenant != null) com.alumindex.common.TenantContext.set(ctxTenant);
                 try {
-                    for (var raw : bucket) processOne(tenantId, raw, tenant, llmDown, c, errorLog);
+                    for (var raw : bucket) {
+                        NormalisedRow norm = normByKey.get(rawRowKey(raw));
+                        if (norm == null) norm = localNormalise(raw);   // safety net
+                        processOne(tenantId, raw, norm, tenant, c, errorLog);
+                    }
                 } finally {
                     com.alumindex.common.TenantContext.clear();
                     latch.countDown();
@@ -181,21 +196,83 @@ public class PipelineService {
         }
     }
 
-    /** Processes a single row, tallying the outcome and logging any per-row failure. */
-    private void processOne(UUID tenantId, Map<String, String> raw, Tenant tenant,
-                            AtomicBoolean llmDown, Counters c, List<Object> errorLog) {
+    /**
+     * Normalises a chunk's unique rows with a minimum of OpenAI calls: whole-row cache hits are
+     * reused, misses are sent in batches of {@code llm-batch-size} (one HTTP call per batch, run
+     * concurrently on the pool), and any row the LLM can't return falls back to {@link #localNormalise}.
+     * Returns a map keyed by {@link #rawRowKey}. Trips {@code llmDown} when OpenAI is unavailable.
+     */
+    private Map<String, NormalisedRow> normaliseChunk(List<Map<String, String>> unique,
+                                                      AtomicBoolean llmDown, ExecutorService pool,
+                                                      Map<String, NormalisedRow> cache) {
+        var result = new java.util.concurrent.ConcurrentHashMap<String, NormalisedRow>(unique.size());
+        var misses = new ArrayList<Map<String, String>>();
+        for (var raw : unique) {
+            NormalisedRow cached = cache.get(rawRowKey(raw));
+            if (cached != null) result.put(rawRowKey(raw), cached);
+            else misses.add(raw);
+        }
+        if (misses.isEmpty()) return result;
+
+        // OpenAI already proven down → skip calls, normalise deterministically.
+        if (llmDown.get()) {
+            for (var raw : misses) put(result, cache, raw, localNormalise(raw));
+            return result;
+        }
+
+        int batch = Math.max(1, llmBatchSize);
+        var subBatches = new ArrayList<List<Map<String, String>>>();
+        for (int i = 0; i < misses.size(); i += batch) {
+            subBatches.add(misses.subList(i, Math.min(misses.size(), i + batch)));
+        }
+        var latch = new CountDownLatch(subBatches.size());
+        for (var sb : subBatches) {
+            pool.submit(() -> {
+                try {
+                    List<NormalisedRow> norms = null;
+                    try {
+                        norms = llm.normaliseBatch(sb);
+                    } catch (LlmUnavailableException e) {
+                        llmDown.set(true);
+                        log.warn("LLM unavailable — switching to deterministic normalisation: {}",
+                                e.getMessage());
+                    }
+                    for (int i = 0; i < sb.size(); i++) {
+                        var raw = sb.get(i);
+                        NormalisedRow nr = (norms != null && i < norms.size() && norms.get(i) != null)
+                                ? norms.get(i) : localNormalise(raw);
+                        put(result, cache, raw, nr);
+                    }
+                } finally {
+                    latch.countDown();
+                }
+            });
+        }
         try {
-            switch (processRow(tenantId, raw, tenant, llmDown)) {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+        return result;
+    }
+
+    private static void put(Map<String, NormalisedRow> result, Map<String, NormalisedRow> cache,
+                            Map<String, String> raw, NormalisedRow nr) {
+        String key = rawRowKey(raw);
+        cache.put(key, nr);
+        result.put(key, nr);
+    }
+
+    /** Processes a single (already-normalised) row, tallying the outcome and logging failures. */
+    private void processOne(UUID tenantId, Map<String, String> raw, NormalisedRow norm,
+                            Tenant tenant, Counters c, List<Object> errorLog) {
+        try {
+            switch (processRow(tenantId, raw, norm, tenant)) {
                 case "inserted"  -> c.inserted.incrementAndGet();
                 case "updated"   -> c.updated.incrementAndGet();
                 case "unchanged" -> c.unchanged.incrementAndGet();
                 default          -> c.failed.incrementAndGet();
             }
-        } catch (LlmUnavailableException e) {
-            c.failed.incrementAndGet();
-            errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
-                    "error", "OpenAI API unavailable"));
-            log.warn("LLM unavailable for row {}: {}", raw.get("full_name"), e.getMessage());
         } catch (AmbiguousMatchException e) {
             c.failed.incrementAndGet();
             errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"), "error", "AMBIGUOUS_NAME"));
@@ -279,25 +356,9 @@ public class PipelineService {
     }
 
     @Transactional
-    String processRow(UUID tenantId, Map<String, String> raw, Tenant tenant,
-                      java.util.concurrent.atomic.AtomicBoolean llmDown) {
-        // Step 2 — LLM normalisation (always before matching). If OpenAI is
-        // unavailable the row is normalised deterministically from the mapped
-        // columns so the import still succeeds (lower confidence score).
-        NormalisedRow norm;
-        if (llmDown.get()) {
-            norm = localNormalise(raw);
-        } else {
-            try {
-                norm = llm.normalise(raw);
-            } catch (LlmUnavailableException e) {
-                llmDown.set(true);
-                log.warn("LLM unavailable — switching batch to deterministic normalisation: {}",
-                        e.getMessage());
-                norm = localNormalise(raw);
-            }
-        }
-
+    String processRow(UUID tenantId, Map<String, String> raw, NormalisedRow norm, Tenant tenant) {
+        // Normalisation (step 2) is done up-front per chunk — batched OpenAI calls with a
+        // whole-row cache and deterministic fallback — so this method only matches + writes.
         String linkedinUrl  = raw.getOrDefault("linkedin_url", "").trim();
         Integer gradYear    = parseYear(raw.get("education_end_year"));
 
