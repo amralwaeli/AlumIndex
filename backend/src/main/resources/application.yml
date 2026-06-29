@@ -27,15 +27,6 @@ spring:
     locations: classpath:db/migration
     baseline-on-migrate: true
 
-  mail:
-    host: ${MAIL_HOST:smtp.gmail.com}
-    port: ${MAIL_PORT:587}
-    username: ${MAIL_USERNAME:}
-    password: ${MAIL_PASSWORD:}
-    properties:
-      mail.smtp.auth: true
-      mail.smtp.starttls.enable: true
-
   servlet:
     multipart:
       max-file-size: 51MB   # allow up to 50 MB + header overhead; enforced precisely in service
@@ -53,6 +44,13 @@ alumindex:
     # Parallel rows normalised at once. Higher = faster imports, but stay
     # under spring.datasource.hikari.maximum-pool-size and your OpenAI rate tier.
     concurrency: ${IMPORT_CONCURRENCY:8}
+  mail:
+    # Email is sent via Brevo's HTTPS API (not SMTP) so it works on hosts that
+    # block outbound SMTP ports, e.g. Render's free tier. Get an API key at
+    # brevo.com and verify the sender address before sending.
+    brevo-api-key: ${BREVO_API_KEY:}
+    from: ${MAIL_FROM:${MAIL_USERNAME:}}   # must be a Brevo-verified sender
+    from-name: ${MAIL_FROM_NAME:AlumIndex}
   frontend:
     origin: ${FRONTEND_ORIGIN:http://localhost:5173}
 
@@ -71,8 +69,3 @@ management:
   endpoint:
     health:
       show-details: never
-  health:
-    mail:
-      # mail is optional (MailService skips when unconfigured); the SMTP probe
-      # adds ~10s per health call and marks the app DOWN when creds are blank
-      enabled: false

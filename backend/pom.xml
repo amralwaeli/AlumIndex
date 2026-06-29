@@ -49,12 +49,6 @@
       <artifactId>spring-boot-starter-validation</artifactId>
     </dependency>
 
-    <!-- Mail (invite + approval emails) -->
-    <dependency>
-      <groupId>org.springframework.boot</groupId>
-      <artifactId>spring-boot-starter-mail</artifactId>
-    </dependency>
-
     <!-- Actuator (healthcheck for Docker) -->
     <dependency>
       <groupId>org.springframework.boot</groupId>

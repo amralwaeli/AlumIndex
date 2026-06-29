@@ -1,25 +1,41 @@
 package com.alumindex.service;
 
-import lombok.RequiredArgsConstructor;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.mail.MailException;
-import org.springframework.mail.SimpleMailMessage;
-import org.springframework.mail.javamail.JavaMailSender;
 import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 
+import java.io.IOException;
+import java.net.URI;
+import java.net.http.HttpClient;
+import java.net.http.HttpRequest;
+import java.net.http.HttpResponse;
+import java.time.Duration;
 import java.time.Instant;
 
 @Service
-@RequiredArgsConstructor
 @Slf4j
 public class MailService {
 
-    private final JavaMailSender mailSender;
+    // Brevo (Sendinblue) transactional email API — sent over HTTPS so it works on
+    // hosts that block outbound SMTP ports (e.g. Render's free tier).
+    private static final String BREVO_ENDPOINT = "https://api.brevo.com/v3/smtp/email";
 
-    @Value("${spring.mail.username:}")
+    private final HttpClient http = HttpClient.newBuilder()
+            .connectTimeout(Duration.ofSeconds(10))
+            .build();
+    private final ObjectMapper json = new ObjectMapper();
+
+    @Value("${alumindex.mail.brevo-api-key:}")
+    private String brevoApiKey;
+
+    @Value("${alumindex.mail.from:}")
     private String fromAddress;
+
+    @Value("${alumindex.mail.from-name:AlumIndex}")
+    private String fromName;
 
     @Value("${alumindex.frontend.origin:http://localhost:5173}")
     private String frontendOrigin;
@@ -119,21 +135,44 @@ public class MailService {
     // ── Core send — throws on any failure ────────────────────────────────────
 
     private void send(String to, String subject, String body) {
+        if (brevoApiKey == null || brevoApiKey.isBlank()) {
+            throw new IllegalStateException(
+                "BREVO_API_KEY is not configured. Add alumindex.mail.brevo-api-key to your profile.");
+        }
         if (fromAddress == null || fromAddress.isBlank()) {
             throw new IllegalStateException(
-                "MAIL_USERNAME is not configured. Add spring.mail.username to your local profile.");
+                "MAIL_FROM (sender address) is not configured. Add alumindex.mail.from to your profile.");
         }
         try {
-            var msg = new SimpleMailMessage();
-            msg.setFrom(fromAddress);
-            msg.setTo(to);
-            msg.setSubject(subject);
-            msg.setText(body);
-            mailSender.send(msg);
+            ObjectNode payload = json.createObjectNode();
+            ObjectNode sender = payload.putObject("sender");
+            sender.put("email", fromAddress);
+            sender.put("name", fromName);
+            payload.putArray("to").addObject().put("email", to);
+            payload.put("subject", subject);
+            payload.put("textContent", body);
+
+            HttpRequest req = HttpRequest.newBuilder(URI.create(BREVO_ENDPOINT))
+                    .timeout(Duration.ofSeconds(15))
+                    .header("api-key", brevoApiKey)
+                    .header("content-type", "application/json")
+                    .header("accept", "application/json")
+                    .POST(HttpRequest.BodyPublishers.ofString(json.writeValueAsString(payload)))
+                    .build();
+
+            HttpResponse<String> resp = http.send(req, HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() / 100 != 2) {
+                throw new IllegalStateException(
+                    "Brevo API returned HTTP " + resp.statusCode() + ": " + resp.body());
+            }
             log.debug("Email sent to {}: {}", to, subject);
-        } catch (MailException e) {
+        } catch (IOException e) {
             log.error("Failed to send email to {}: {}", to, e.getMessage());
-            throw e;
+            throw new IllegalStateException("Failed to send email to " + to, e);
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+            log.error("Interrupted while sending email to {}", to);
+            throw new IllegalStateException("Interrupted while sending email to " + to, e);
         }
     }
 }
