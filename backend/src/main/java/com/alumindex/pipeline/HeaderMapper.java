@@ -51,26 +51,48 @@ public class HeaderMapper {
         if (rows.isEmpty()) return rows;
 
         List<String> headers = new ArrayList<>(rows.get(0).keySet());
-        Map<String, String> mapping = resolveMapping(headers, rows);
-        validateLooksLikeAlumni(mapping, headers, rows);
+        Map<String, String> mapping = resolveAndValidate(headers, rows);
 
         String today = LocalDate.now().toString();
         var out = new ArrayList<Map<String, String>>(rows.size());
         for (var raw : rows) {
-            var row = new LinkedHashMap<String, String>();
-            raw.forEach((k, v) -> {
-                String key = mapping.getOrDefault(k, normalise(k));
-                String val = v == null ? "" : v.trim();
-                // first non-blank value wins when two source columns map to one field
-                row.merge(key, val, (a, b) -> a.isBlank() ? b : a);
-            });
-            if (row.values().stream().allMatch(String::isBlank)) continue;
-
-            deriveNames(row);
-            if (blank(row.get("captured_date"))) row.put("captured_date", today);
-            out.add(row);
+            var row = mapRow(raw, mapping, today);
+            if (row != null) out.add(row);
         }
         return out;
+    }
+
+    /**
+     * Resolves the header→canonical mapping AND runs the alumni-file validation gate
+     * from just a header list + a few sample rows. Throws {@link IllegalArgumentException}
+     * if no name column is found or the file isn't alumni data. Used by the streaming
+     * import so the whole file never has to be materialised to validate it.
+     */
+    public Map<String, String> resolveAndValidate(List<String> headers,
+                                                  List<Map<String, String>> sampleRows) {
+        Map<String, String> mapping = resolveMapping(headers, sampleRows);
+        validateLooksLikeAlumni(mapping, headers, sampleRows);
+        return mapping;
+    }
+
+    /**
+     * Maps one raw row onto the canonical schema using a precomputed mapping.
+     * Returns {@code null} if every cell is blank (the row should be dropped).
+     */
+    public Map<String, String> mapRow(Map<String, String> raw,
+                                      Map<String, String> mapping, String today) {
+        var row = new LinkedHashMap<String, String>();
+        raw.forEach((k, v) -> {
+            String key = mapping.getOrDefault(k, normalise(k));
+            String val = v == null ? "" : v.trim();
+            // first non-blank value wins when two source columns map to one field
+            row.merge(key, val, (a, b) -> a.isBlank() ? b : a);
+        });
+        if (row.values().stream().allMatch(String::isBlank)) return null;
+
+        deriveNames(row);
+        if (blank(row.get("captured_date"))) row.put("captured_date", today);
+        return row;
     }
 
     private Map<String, String> resolveMapping(List<String> headers,

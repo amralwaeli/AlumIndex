@@ -19,6 +19,11 @@ spring:
       hibernate:
         dialect: org.hibernate.dialect.PostgreSQLDialect
         format_sql: false
+        # Batch the per-chunk inserts/updates into multi-row JDBC statements.
+        jdbc:
+          batch_size: 50
+        order_inserts: true
+        order_updates: true
     show-sql: false
     open-in-view: false
 
@@ -29,8 +34,10 @@ spring:
 
   servlet:
     multipart:
-      max-file-size: 51MB   # allow up to 50 MB + header overhead; enforced precisely in service
-      max-request-size: 52MB
+      # Disk-backed by the servlet container (not heap); precise cap enforced in CsvXlsxParser.
+      max-file-size: 205MB
+      max-request-size: 210MB
+      file-size-threshold: 1MB   # spill to disk early so large uploads never sit in heap
 
 alumindex:
   jwt:
@@ -44,6 +51,9 @@ alumindex:
     # Parallel rows normalised at once. Higher = faster imports, but stay
     # under spring.datasource.hikari.maximum-pool-size and your OpenAI rate tier.
     concurrency: ${IMPORT_CONCURRENCY:8}
+    # Rows held in memory at once. Keeps peak heap bounded regardless of file size;
+    # processed as a unit (dedupe + bucket + flush progress) before the next chunk.
+    chunk-size: ${IMPORT_CHUNK_SIZE:500}
   mail:
     # Email is sent via Resend's HTTPS API (not SMTP) so it works on hosts that
     # block outbound SMTP ports, e.g. Render's free tier. Get an API key at

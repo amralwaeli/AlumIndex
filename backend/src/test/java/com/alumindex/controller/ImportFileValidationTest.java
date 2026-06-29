@@ -15,6 +15,7 @@ import org.springframework.test.context.ActiveProfiles;
 import org.springframework.test.web.servlet.MockMvc;
 
 import java.nio.charset.StandardCharsets;
+import java.nio.file.Path;
 import java.util.UUID;
 
 import static org.hamcrest.Matchers.containsString;
@@ -65,7 +66,7 @@ class ImportFileValidationTest {
                 .andExpect(jsonPath("$.message").value(containsString("alumni")))
                 .andExpect(jsonPath("$.message").value(containsString("accounting")));
 
-        verify(pipeline, never()).runAsync(any(), any(), anyList(), any());
+        verify(pipeline, never()).runAsync(any(), any(), any(Path.class), anyString(), anyMap(), any());
     }
 
     @Test
@@ -80,6 +81,6 @@ class ImportFileValidationTest {
                 .andExpect(status().isAccepted());
 
         verify(llm, never()).classifyAlumniFile(anyList(), anyList());
-        verify(pipeline, times(1)).runAsync(any(), any(), anyList(), any());
+        verify(pipeline, times(1)).runAsync(any(), any(), any(Path.class), anyString(), anyMap(), any());
     }
 }

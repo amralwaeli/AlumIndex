@@ -12,11 +12,15 @@ import org.springframework.scheduling.annotation.Async;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
+import java.io.IOException;
 import java.math.BigDecimal;
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.time.LocalDate;
 import java.util.*;
 import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
-import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 
@@ -37,134 +41,209 @@ public class PipelineService {
     private final ProfileSnapshotRepository snapshotRepo;
     private final CareerEventRepository eventRepo;
     private final ImportBatchRepository batchRepo;
+    private final CsvXlsxParser parser;
+    private final HeaderMapper headerMapper;
 
     /** Concurrent normalisation workers. Keep ≤ DB pool size and within your OpenAI rate tier. */
     @Value("${alumindex.import.concurrency:8}")
     private int concurrency;
 
+    /** Rows held in memory at once. Keeps peak heap bounded regardless of file size. */
+    @Value("${alumindex.import.chunk-size:500}")
+    private int chunkSize;
+
+    /** Per-run tallies, shared across chunk workers via atomics. */
+    private static final class Counters {
+        final AtomicInteger inserted  = new AtomicInteger();
+        final AtomicInteger updated    = new AtomicInteger();
+        final AtomicInteger unchanged  = new AtomicInteger();
+        final AtomicInteger failed     = new AtomicInteger();
+        final AtomicInteger processed  = new AtomicInteger();
+    }
+
+    /**
+     * Streaming import — reads the uploaded file from {@code file} in bounded chunks so peak
+     * heap is one chunk (~{@code chunk-size} rows) regardless of a 1K or 1M-row file. Each row
+     * is mapped with {@code mapping}, exact-duplicate rows within a chunk are collapsed, and the
+     * chunk is processed by the worker pool before the next chunk is read. The temp file is
+     * deleted when the run finishes (success or failure).
+     */
+    @Async
+    public void runAsync(UUID tenantId, UUID batchId, Path file, String filename,
+                         Map<String, String> mapping, Tenant tenant) {
+        var batch = batchRepo.findById(batchId).orElseThrow();
+        final UUID ctxTenant = com.alumindex.common.TenantContext.get();
+        var errorLog = Collections.synchronizedList(new ArrayList<Object>());
+        var llmDown  = new AtomicBoolean(false);
+        var c        = new Counters();
+        int workers  = Math.max(1, concurrency);
+        var pool     = Executors.newFixedThreadPool(workers);
+        String today = LocalDate.now().toString();
+
+        var chunk = new ArrayList<Map<String, String>>(chunkSize);
+        try {
+            parser.stream(file, filename, new ArrayList<>(), raw -> {
+                Map<String, String> mapped = headerMapper.mapRow(raw, mapping, today);
+                if (mapped == null) return;          // all-blank row dropped
+                chunk.add(mapped);
+                if (chunk.size() >= chunkSize) {
+                    processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant);
+                    saveProgress(batch, c);
+                    chunk.clear();
+                }
+            });
+            if (!chunk.isEmpty()) {
+                processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant);
+                chunk.clear();
+            }
+        } catch (Exception e) {
+            log.error("Import batch {} failed while streaming: {}", batchId, e.getMessage(), e);
+            errorLog.add(0, Map.of("row", "*", "code", "PARSE_ERROR",
+                    "error", "Failed to read file: " + e.getMessage()));
+            finalizeBatch(batch, c, errorLog, llmDown, ImportBatch.Status.failed);
+            pool.shutdown();
+            deleteQuietly(file);
+            return;
+        }
+        pool.shutdown();
+        deleteQuietly(file);
+        finalizeBatch(batch, c, errorLog, llmDown, ImportBatch.Status.completed);
+        log.info("Batch {} completed: +{} ~{} ={} !{}", batchId,
+                c.inserted.get(), c.updated.get(), c.unchanged.get(), c.failed.get());
+    }
+
+    /**
+     * In-memory import — for callers that already hold the mapped rows (and tests). Processes the
+     * list in the same bounded chunks as the streaming path.
+     */
     @Async
     public void runAsync(UUID tenantId, UUID batchId,
                          List<Map<String, String>> rows, Tenant tenant) {
         var batch = batchRepo.findById(batchId).orElseThrow();
-        // worker threads don't inherit this thread's ThreadLocal — capture the
-        // tenant context now so each worker resolves RLS exactly as we do here.
         final UUID ctxTenant = com.alumindex.common.TenantContext.get();
-
-        var errorLog  = Collections.synchronizedList(new ArrayList<Object>());
-        // circuit breaker: once OpenAI proves unavailable, remaining rows go
-        // straight to the deterministic fallback instead of retrying every row.
-        var llmDown   = new AtomicBoolean(false);
-        var inserted  = new AtomicInteger();
-        var updated   = new AtomicInteger();
-        var unchanged = new AtomicInteger();
-        var failed    = new AtomicInteger();
-        var processed = new AtomicInteger();
-
-        int total = rows.size();
-
-        // Pre-pass — collapse exact-duplicate rows within the file. The first occurrence
-        // is processed; byte-identical copies are counted "unchanged" with no DB work, so
-        // duplicated/re-uploaded rows never create spurious updates or extra records.
-        var seenRaw    = new HashSet<String>();
-        var uniqueRows = new ArrayList<Map<String, String>>(total);
-        for (var raw : rows) {
-            if (seenRaw.add(rawRowKey(raw))) uniqueRows.add(raw);
-        }
-        int exactDuplicates = total - uniqueRows.size();
-        if (exactDuplicates > 0) {
-            unchanged.addAndGet(exactDuplicates);
-            processed.addAndGet(exactDuplicates);
-        }
-
-        int workers = Math.max(1, Math.min(concurrency, Math.max(1, uniqueRows.size())));
-
-        // Partition the unique rows by identity so every row referring to the same person
-        // lands in one bucket and is processed in order. This keeps the insert-then-update
-        // semantics and prevents two threads from inserting the same person twice (the race).
-        List<List<Map<String, String>>> buckets = partitionByIdentity(uniqueRows, workers);
-
-        var pool  = Executors.newFixedThreadPool(workers);
-        var latch = new CountDownLatch(buckets.size());
+        var errorLog = Collections.synchronizedList(new ArrayList<Object>());
+        var llmDown  = new AtomicBoolean(false);
+        var c        = new Counters();
+        int workers  = Math.max(1, concurrency);
+        var pool     = Executors.newFixedThreadPool(workers);
         try {
-            for (var bucket : buckets) {
-                pool.submit(() -> {
-                    if (ctxTenant != null) com.alumindex.common.TenantContext.set(ctxTenant);
-                    try {
-                        for (Map<String, String> raw : bucket) {
-                            try {
-                                switch (processRow(tenantId, raw, tenant, llmDown)) {
-                                    case "inserted"  -> inserted.incrementAndGet();
-                                    case "updated"   -> updated.incrementAndGet();
-                                    case "unchanged" -> unchanged.incrementAndGet();
-                                    default          -> failed.incrementAndGet();
-                                }
-                            } catch (LlmUnavailableException e) {
-                                failed.incrementAndGet();
-                                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
-                                        "error", "OpenAI API unavailable"));
-                                log.warn("LLM unavailable for row {}: {}",
-                                        raw.get("full_name"), e.getMessage());
-                            } catch (AmbiguousMatchException e) {
-                                failed.incrementAndGet();
-                                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
-                                        "error", "AMBIGUOUS_NAME"));
-                            } catch (Exception e) {
-                                failed.incrementAndGet();
-                                errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
-                                        "error", e.getMessage()));
-                                log.warn("Row processing error: {}", e.getMessage());
-                            } finally {
-                                processed.incrementAndGet();
-                            }
-                        }
-                    } finally {
-                        com.alumindex.common.TenantContext.clear();
-                        latch.countDown();
-                    }
-                });
+            for (int i = 0; i < rows.size(); i += chunkSize) {
+                var chunk = new ArrayList<>(rows.subList(i, Math.min(rows.size(), i + chunkSize)));
+                processChunk(chunk, tenantId, tenant, llmDown, pool, workers, c, errorLog, ctxTenant);
+                saveProgress(batch, c);
             }
-
-            // Single-writer progress: only this thread mutates/saves the batch
-            // entity, so the shared JPA entity is never touched by two threads.
-            while (!latch.await(750, TimeUnit.MILLISECONDS)) {
-                saveProgress(batch, processed, inserted, updated, unchanged, failed);
-            }
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
         } finally {
             pool.shutdown();
         }
+        finalizeBatch(batch, c, errorLog, llmDown, ImportBatch.Status.completed);
+        log.info("Batch {} completed (in-memory): +{} ~{} ={} !{}", batchId,
+                c.inserted.get(), c.updated.get(), c.unchanged.get(), c.failed.get());
+    }
 
-        // non-fatal, but operators must see it (Overview + import card)
-        if (llmDown.get()) {
-            errorLog.add(0, Map.of("row", "*",
-                    "code", "LLM_FALLBACK",
-                    "error", "OpenAI was unavailable — rows imported with basic rule-based "
-                           + "normalisation (lower quality). Check your OpenAI API key/quota and re-import."));
+    /**
+     * Processes one chunk: collapse exact-duplicate rows (counted "unchanged"), partition the
+     * rest by identity so same-person rows share a bucket (prevents the duplicate-insert race),
+     * then run the buckets on the shared pool and block until the chunk is done.
+     */
+    private void processChunk(List<Map<String, String>> chunk, UUID tenantId, Tenant tenant,
+                              AtomicBoolean llmDown, ExecutorService pool, int workers,
+                              Counters c, List<Object> errorLog, UUID ctxTenant) {
+        var seen   = new HashSet<String>();
+        var unique = new ArrayList<Map<String, String>>(chunk.size());
+        for (var raw : chunk) {
+            if (seen.add(rawRowKey(raw))) unique.add(raw);
         }
+        int dupes = chunk.size() - unique.size();
+        if (dupes > 0) {
+            c.unchanged.addAndGet(dupes);
+            c.processed.addAndGet(dupes);
+        }
+        if (unique.isEmpty()) return;
 
-        batch.setRecordCount(total);
-        batch.setProcessedCount(processed.get());
-        batch.setInsertedCount(inserted.get());
-        batch.setUpdatedCount(updated.get());
-        batch.setUnchangedCount(unchanged.get());
-        batch.setFailedCount(failed.get());
-        batch.setStatus(ImportBatch.Status.completed);
-        batch.setErrorLog(errorLog.isEmpty() ? null : new ArrayList<>(errorLog));
-        batchRepo.save(batch);
-        log.info("Batch {} completed: +{} ~{} ={} !{}", batchId,
-                inserted.get(), updated.get(), unchanged.get(), failed.get());
+        int n = Math.max(1, Math.min(workers, unique.size()));
+        List<List<Map<String, String>>> buckets = partitionByIdentity(unique, n);
+        var latch = new CountDownLatch(buckets.size());
+        for (var bucket : buckets) {
+            pool.submit(() -> {
+                if (ctxTenant != null) com.alumindex.common.TenantContext.set(ctxTenant);
+                try {
+                    for (var raw : bucket) processOne(tenantId, raw, tenant, llmDown, c, errorLog);
+                } finally {
+                    com.alumindex.common.TenantContext.clear();
+                    latch.countDown();
+                }
+            });
+        }
+        try {
+            latch.await();
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** Processes a single row, tallying the outcome and logging any per-row failure. */
+    private void processOne(UUID tenantId, Map<String, String> raw, Tenant tenant,
+                            AtomicBoolean llmDown, Counters c, List<Object> errorLog) {
+        try {
+            switch (processRow(tenantId, raw, tenant, llmDown)) {
+                case "inserted"  -> c.inserted.incrementAndGet();
+                case "updated"   -> c.updated.incrementAndGet();
+                case "unchanged" -> c.unchanged.incrementAndGet();
+                default          -> c.failed.incrementAndGet();
+            }
+        } catch (LlmUnavailableException e) {
+            c.failed.incrementAndGet();
+            errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
+                    "error", "OpenAI API unavailable"));
+            log.warn("LLM unavailable for row {}: {}", raw.get("full_name"), e.getMessage());
+        } catch (AmbiguousMatchException e) {
+            c.failed.incrementAndGet();
+            errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"), "error", "AMBIGUOUS_NAME"));
+        } catch (Exception e) {
+            c.failed.incrementAndGet();
+            errorLog.add(Map.of("row", raw.getOrDefault("full_name", "?"),
+                    "error", String.valueOf(e.getMessage())));
+            log.warn("Row processing error: {}", e.getMessage());
+        } finally {
+            c.processed.incrementAndGet();
+        }
     }
 
     /** Live progress flush — runs only on the orchestrator thread (single writer). */
-    private void saveProgress(ImportBatch batch, AtomicInteger processed, AtomicInteger inserted,
-                              AtomicInteger updated, AtomicInteger unchanged, AtomicInteger failed) {
-        batch.setProcessedCount(processed.get());
-        batch.setInsertedCount(inserted.get());
-        batch.setUpdatedCount(updated.get());
-        batch.setUnchangedCount(unchanged.get());
-        batch.setFailedCount(failed.get());
+    private void saveProgress(ImportBatch batch, Counters c) {
+        batch.setProcessedCount(c.processed.get());
+        batch.setInsertedCount(c.inserted.get());
+        batch.setUpdatedCount(c.updated.get());
+        batch.setUnchangedCount(c.unchanged.get());
+        batch.setFailedCount(c.failed.get());
         batchRepo.save(batch);
+    }
+
+    /** Writes the final counts + status; surfaces the LLM-fallback notice for operators. */
+    private void finalizeBatch(ImportBatch batch, Counters c, List<Object> errorLog,
+                               AtomicBoolean llmDown, ImportBatch.Status status) {
+        if (llmDown.get()) {
+            errorLog.add(0, Map.of("row", "*", "code", "LLM_FALLBACK",
+                    "error", "OpenAI was unavailable — rows imported with basic rule-based "
+                           + "normalisation (lower quality). Check your OpenAI API key/quota and re-import."));
+        }
+        batch.setRecordCount(c.processed.get());
+        batch.setProcessedCount(c.processed.get());
+        batch.setInsertedCount(c.inserted.get());
+        batch.setUpdatedCount(c.updated.get());
+        batch.setUnchangedCount(c.unchanged.get());
+        batch.setFailedCount(c.failed.get());
+        batch.setStatus(status);
+        batch.setErrorLog(errorLog.isEmpty() ? null : new ArrayList<>(errorLog));
+        batchRepo.save(batch);
+    }
+
+    private static void deleteQuietly(Path file) {
+        try {
+            if (file != null) Files.deleteIfExists(file);
+        } catch (IOException e) {
+            log.warn("Could not delete temp import file {}: {}", file, e.getMessage());
+        }
     }
 
     /** Stable content key for a raw row — used to collapse byte-identical rows in a file. */
