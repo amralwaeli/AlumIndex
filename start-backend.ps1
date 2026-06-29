@@ -9,6 +9,7 @@ if ($pids) { Start-Sleep -Seconds 2 }
 
 $env:MAIL_FROM = "no-reply@alumindex.org"   # must be on a Resend-verified domain
 $env:RESEND_API_KEY = ""                     # paste your Resend API key here to send mail locally
+$env:OPENAI_API_KEY = ""                     # paste your funded OpenAI key here (same one used in Render)
 $env:SPRING_PROFILES_ACTIVE = "local"
 
 $jar = "$PSScriptRoot\backend\target\alumindex-backend-1.0.0-SNAPSHOT.jar"

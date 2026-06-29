@@ -124,7 +124,9 @@ public class PipelineService {
         // non-fatal, but operators must see it (Overview + import card)
         if (llmDown.get()) {
             errorLog.add(0, Map.of("row", "*",
-                    "error", "OpenAI API unavailable — fallback normalisation used (check quota)"));
+                    "code", "LLM_FALLBACK",
+                    "error", "OpenAI was unavailable — rows imported with basic rule-based "
+                           + "normalisation (lower quality). Check your OpenAI API key/quota and re-import."));
         }
 
         batch.setRecordCount(total);

@@ -1,6 +1,6 @@
 import { useState, useRef, useEffect, useCallback } from 'react'
 import api from '@/lib/api'
-import { Upload, CheckCircle, XCircle, Loader2, FileText, X } from 'lucide-react'
+import { Upload, CheckCircle, XCircle, Loader2, FileText, X, AlertTriangle } from 'lucide-react'
 import type { ImportBatch, Tenant } from '@/types'
 
 /**
@@ -16,13 +16,22 @@ interface TrackedImport {
   batch: ImportBatch
   status: 'processing' | 'completed' | 'failed'
   errorSummary: string | null
+  degraded: boolean
 }
 
-/** Pulls distinct error reasons out of the batch error log (max 2 shown). */
+/** True when the pipeline fell back to rule-based normalisation (OpenAI unavailable). */
+function isLlmDegraded(batch: ImportBatch): boolean {
+  if (!batch.errorLog) return false
+  return (batch.errorLog as Array<{ code?: string }>).some(e => e?.code === 'LLM_FALLBACK')
+}
+
+/** Distinct per-row error reasons (max 2). Excludes the LLM-fallback notice, shown separately. */
 function summariseErrors(batch: ImportBatch): string | null {
   if (!batch.errorLog || batch.errorLog.length === 0) return null
   const reasons = [...new Set(
-    (batch.errorLog as Array<{ error?: string }>).map(e => e?.error).filter(Boolean),
+    (batch.errorLog as Array<{ error?: string; code?: string }>)
+      .filter(e => e?.code !== 'LLM_FALLBACK')
+      .map(e => e?.error).filter(Boolean),
   )] as string[]
   if (reasons.length === 0) return null
   return reasons.slice(0, 2).join(' · ') + (reasons.length > 2 ? ' …' : '')
@@ -72,6 +81,7 @@ export default function ImportPage() {
             status: data.status === 'completed' ? 'completed'
                   : data.status === 'failed' ? 'failed' : 'processing',
             errorSummary: summariseErrors(data),
+            degraded: isLlmDegraded(data),
           }
         : imp))
       if (data.status === 'completed' || data.status === 'failed') stopPolling(id)
@@ -116,6 +126,7 @@ export default function ImportPage() {
           batch: data,
           status: 'processing',
           errorSummary: null,
+          degraded: false,
         }, ...prev])
         pollersRef.current.set(data.id, setInterval(() => pollBatch(data.id), 3000))
       }
@@ -206,7 +217,9 @@ export default function ImportPage() {
             <div className="flex items-center gap-3 min-w-0">
               <div className="shrink-0">
                 {imp.status === 'processing' && <Loader2 className="h-5 w-5 text-sapphire animate-spin" />}
-                {imp.status === 'completed' && <CheckCircle className="h-5 w-5 text-emerald" />}
+                {imp.status === 'completed' && (imp.degraded
+                  ? <AlertTriangle className="h-5 w-5 text-amber" />
+                  : <CheckCircle className="h-5 w-5 text-emerald" />)}
                 {imp.status === 'failed' && <XCircle className="h-5 w-5 text-danger" />}
               </div>
               <div className="min-w-0">
@@ -229,6 +242,18 @@ export default function ImportPage() {
               )}
             </div>
           </div>
+
+          {/* AI degraded warning — the import silently fell back to rule-based normalisation */}
+          {imp.degraded && (
+            <div className="mb-4 flex items-start gap-2 rounded-lg border border-amber/40 bg-amber/10 p-3">
+              <AlertTriangle className="h-4 w-4 text-amber mt-0.5 shrink-0" />
+              <p className="text-xs text-amber leading-relaxed">
+                <span className="font-semibold">AI normalisation was unavailable.</span> These rows were
+                imported with basic rule-based normalisation (lower quality, confidence ~0.50). Check your
+                OpenAI API key and quota, then delete this batch and re-import for full results.
+              </p>
+            </div>
+          )}
 
           {/* Real row progress reported by the pipeline */}
           {imp.status === 'processing' && (
