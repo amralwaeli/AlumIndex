@@ -60,14 +60,28 @@ public class PipelineService {
         var failed    = new AtomicInteger();
         var processed = new AtomicInteger();
 
-        int total   = rows.size();
-        int workers = Math.max(1, Math.min(concurrency, total));
+        int total = rows.size();
 
-        // Partition rows by identity so every row referring to the same person
-        // lands in one bucket and is processed in order. This keeps the original
-        // insert-then-update semantics and prevents two threads from inserting
-        // the same person twice (the duplicate race).
-        List<List<Map<String, String>>> buckets = partitionByIdentity(rows, workers);
+        // Pre-pass — collapse exact-duplicate rows within the file. The first occurrence
+        // is processed; byte-identical copies are counted "unchanged" with no DB work, so
+        // duplicated/re-uploaded rows never create spurious updates or extra records.
+        var seenRaw    = new HashSet<String>();
+        var uniqueRows = new ArrayList<Map<String, String>>(total);
+        for (var raw : rows) {
+            if (seenRaw.add(rawRowKey(raw))) uniqueRows.add(raw);
+        }
+        int exactDuplicates = total - uniqueRows.size();
+        if (exactDuplicates > 0) {
+            unchanged.addAndGet(exactDuplicates);
+            processed.addAndGet(exactDuplicates);
+        }
+
+        int workers = Math.max(1, Math.min(concurrency, Math.max(1, uniqueRows.size())));
+
+        // Partition the unique rows by identity so every row referring to the same person
+        // lands in one bucket and is processed in order. This keeps the insert-then-update
+        // semantics and prevents two threads from inserting the same person twice (the race).
+        List<List<Map<String, String>>> buckets = partitionByIdentity(uniqueRows, workers);
 
         var pool  = Executors.newFixedThreadPool(workers);
         var latch = new CountDownLatch(buckets.size());
@@ -153,6 +167,11 @@ public class PipelineService {
         batchRepo.save(batch);
     }
 
+    /** Stable content key for a raw row — used to collapse byte-identical rows in a file. */
+    private static String rawRowKey(Map<String, String> raw) {
+        return new TreeMap<>(raw).toString();
+    }
+
     /** Buckets rows so all rows for the same person share a bucket (processed in order). */
     private List<List<Map<String, String>>> partitionByIdentity(
             List<Map<String, String>> rows, int buckets) {
@@ -203,10 +222,11 @@ public class PipelineService {
         String linkedinUrl  = raw.getOrDefault("linkedin_url", "").trim();
         Integer gradYear    = parseYear(raw.get("education_end_year"));
 
-        // Step 3 — Matching (internal only)
-        MatchResult match = matcher.match(tenantId,
-                linkedinUrl.isBlank() ? null : linkedinUrl,
-                norm.fullName(), gradYear);
+        // Step 3 — Matching (internal only). Merge only on the strong LinkedIn key:
+        // name / grad-year collisions are NOT auto-merged, so distinct people who share
+        // a name stay as separate records during a bulk import.
+        MatchResult match = matcher.matchByLinkedin(tenantId,
+                linkedinUrl.isBlank() ? null : linkedinUrl);
 
         return switch (match) {
             case Ambiguous a -> throw new AmbiguousMatchException();

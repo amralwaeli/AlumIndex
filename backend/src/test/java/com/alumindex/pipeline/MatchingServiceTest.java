@@ -158,4 +158,42 @@ class MatchingServiceTest {
         var result = svc.match(tid, null, null, null);
         assertThat(result).isInstanceOf(MatchingService.NotFound.class);
     }
+
+    // ── Import-time matching (LinkedIn-only — Option B) ─────────────────────────
+
+    @Test
+    void matchByLinkedin_exact_url_returns_found_with_0_97() {
+        when(alumniRepo.findByLinkedinUrlAndTenantId("https://linkedin.com/in/alice", tid))
+                .thenReturn(Optional.of(alice));
+
+        var result = svc.matchByLinkedin(tid, "https://linkedin.com/in/alice");
+
+        assertThat(result).isInstanceOf(MatchingService.Found.class);
+        assertThat(((MatchingService.Found) result).confidence()).isEqualTo(0.97);
+        assertThat(((MatchingService.Found) result).alumni()).isEqualTo(alice);
+    }
+
+    @Test
+    void matchByLinkedin_no_url_never_consults_name_and_returns_not_found() {
+        // No LinkedIn → NotFound, even though a name-based match would exist. This is the
+        // Option B guarantee: distinct people sharing a name are never auto-merged.
+        var result = svc.matchByLinkedin(tid, null);
+        assertThat(result).isInstanceOf(MatchingService.NotFound.class);
+    }
+
+    @Test
+    void matchByLinkedin_blank_url_returns_not_found() {
+        var result = svc.matchByLinkedin(tid, "   ");
+        assertThat(result).isInstanceOf(MatchingService.NotFound.class);
+    }
+
+    @Test
+    void matchByLinkedin_unmatched_url_returns_not_found() {
+        when(alumniRepo.findByLinkedinUrlAndTenantId("https://linkedin.com/in/new", tid))
+                .thenReturn(Optional.empty());
+
+        var result = svc.matchByLinkedin(tid, "https://linkedin.com/in/new");
+
+        assertThat(result).isInstanceOf(MatchingService.NotFound.class);
+    }
 }

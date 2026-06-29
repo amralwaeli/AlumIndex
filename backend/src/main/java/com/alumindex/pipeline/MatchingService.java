@@ -58,4 +58,19 @@ public class MatchingService {
 
         return new NotFound();
     }
+
+    /**
+     * Import-time matching: merge an incoming row with an existing record ONLY on the
+     * strong LinkedIn key (L1). Name / graduation-year collisions are never auto-merged,
+     * so two distinct people who happen to share a name stay as separate records during
+     * a bulk import. Use this instead of {@link #match} for first-time/bulk loads where
+     * a weak name match would silently combine different people.
+     */
+    public MatchResult matchByLinkedin(UUID tenantId, String linkedinUrl) {
+        if (linkedinUrl != null && !linkedinUrl.isBlank()) {
+            Optional<Alumni> l1 = alumniRepo.findByLinkedinUrlAndTenantId(linkedinUrl, tenantId);
+            if (l1.isPresent()) return new Found(l1.get(), 0.97);
+        }
+        return new NotFound();
+    }
 }
